@@ -1156,7 +1156,7 @@ export function apply(ctx, rawConfig) {
   function listTool() {
     return {
       name: 'vault_list',
-      description: 'List stored credentials available to this session as metadata only (id, label, privacy level, allowed hosts/methods, masked value, usage). It never returns a secret value. Use the returned id with vault_http; a controlled credential may also be used in a bash/pwsh command as the placeholder [[vault:<id>]].',
+      description: 'List stored credentials available to this session as metadata only (id, label, privacy level, allowed hosts/methods, field names, masked value, usage). It never returns a secret value or a field value. Use the returned id with vault_http; a controlled credential may also be used in a bash/pwsh command as the placeholder [[vault:<id>]].',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {
         schema: {
@@ -1171,7 +1171,7 @@ export function apply(ctx, rawConfig) {
                   kind: { type: 'string' }, hosts: { type: 'array', items: { type: 'string' } },
                   methods: { type: 'array', items: { type: 'string' } },
                   commands: { type: 'array', items: { type: 'string' } },
-                  meta: { type: 'object', additionalProperties: true },
+                  fields: { type: 'array', items: { type: 'string' } },
                   masked: { type: 'string' }, useCount: { type: 'number' },
                   lastUsedAt: { type: 'string' }, expired: { type: 'boolean' },
                 },
@@ -1191,22 +1191,24 @@ export function apply(ctx, rawConfig) {
             if (item.hosts?.length) bits.push(`hosts=${item.hosts.join('|')}`)
             if (item.methods?.length) bits.push(`methods=${item.methods.join('|')}`)
             if (item.commands?.length) bits.push(`commands=${item.commands.join('|')}`)
-            if (item.meta && typeof item.meta === 'object') {
-              const fields = Object.entries(item.meta).map(([key, value]) => `${key}=${value}`)
-              if (fields.length > 0) bits.push(`fields=${fields.join(',')}`)
-            }
+            if (item.fields?.length) bits.push(`fields=${item.fields.join('|')}`)
             bits.push(`used=${item.useCount ?? 0}`)
             if (item.expired) bits.push('EXPIRED')
             return bits.join(' ')
           })
-          return [{ type: 'text', text: [`可用凭证（只显示元数据）：`, ...lines, '', '用法：vault_http({ id, method, url, headers?, body? })；controlled 等级可在 bash/pwsh 命令中写 [[vault:<id>]] 占位符；非密钥字段用 [[vault:<id>:<字段名>]]。'].join('\n') }]
+          return [{ type: 'text', text: [`可用凭证（只显示元数据）：`, ...lines, '', '用法：vault_http({ id, method, url, headers?, body? })；controlled 等级可在 bash/pwsh 命令中写 [[vault:<id>]] 占位符；字段用 [[vault:<id>:<字段名>]]，字段值不会显示。'].join('\n') }]
         },
       },
       async execute() {
         await ensureLoaded()
         return {
-          items: Object.values(data.items).map((item) => toLossless(itemMeta(item))),
-          note: 'Values are never returned. Use vault_http for sealed/ephemeral credentials; controlled credentials may also be used as [[vault:<id>]] in bash/pwsh.',
+          items: Object.values(data.items).map((item) => {
+            const summary = itemMeta(item)
+            delete summary.meta
+            summary.fields = Object.keys(item.meta || {})
+            return toLossless(summary)
+          }),
+          note: 'Values are never returned, including non-secret field values. Use field names with [[vault:<id>:<field>]] placeholders; controlled credentials may also be used as [[vault:<id>]] in bash/pwsh.',
         }
       },
     }
@@ -1604,7 +1606,7 @@ export function apply(ctx, rawConfig) {
           '- `vault_http({ id, method, url, headers?, body? })` performs one HTTP request with the secret injected by the vault. The host and method must be allowed by that credential; redirects are not followed; the response is bounded and scrubbed.',
           '- `vault_gh({ credential, args })` runs the managed GitHub CLI (`gh`) with a controlled credential injected as GH_TOKEN. gh is downloaded on first use from the official cli/cli release and verified by SHA-256; `args` is an argv array, and `--json`/`--jq` keep output small. sealed/ephemeral credentials are refused.',
           '- For a `controlled` credential you may also write the placeholder `[[vault:<id>]]` inside a bash/pwsh command; the vault replaces it just before execution while the session log keeps the placeholder. `sealed` and `ephemeral` credentials must use `vault_http`.',
-          '- Non-secret fields stored on a credential (for example `account_id` for Cloudflare) are shown by `vault_list` and can be referenced as `[[vault:<id>:<field>]]` in a bash/pwsh command, in a `vault_http` URL, or in its headers/body.',
+          '- Non-secret fields stored on a credential (for example `account_id` for Cloudflare) are shown by `vault_list` as names only; values stay hidden and can be referenced as `[[vault:<id>:<field>]]` in a bash/pwsh command, in a `vault_http` URL, or in its headers/body.',
           '- `ephemeral` credentials ask the user for confirmation on every use.',
           '- Never ask the user to paste a secret into chat. If a use is denied, report the denial reason and suggest the user adjust the credential policy in Settings → Secret Vault.',
         ].join('\n'),

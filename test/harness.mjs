@@ -180,9 +180,9 @@ try {
 
   const list = await tools.vault_list.execute({}, {})
   check('vault_list hides secret', JSON.stringify(list).includes(SECRET) === false && list.items.length === 1)
-  check('vault_list exposes non-secret fields', JSON.stringify(list).includes('acct-123'), JSON.stringify(list))
+  check('vault_list exposes field names only', JSON.stringify(list).includes('account_id') && JSON.stringify(list).includes('acct-123') === false, JSON.stringify(list))
   const listRender = JSON.stringify(tools.vault_list.output.render({}, list))
-  check('vault_list render hides secret', listRender.includes(SECRET) === false && listRender.includes('test-token'))
+  check('vault_list render hides secret and field value', listRender.includes(SECRET) === false && listRender.includes('acct-123') === false && listRender.includes('test-token'))
 
   const http1 = await tools.vault_http.execute(
     { id: 'test-token', method: 'GET', url: `http://127.0.0.1:${port}/echo` },

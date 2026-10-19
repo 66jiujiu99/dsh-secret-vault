@@ -106,17 +106,17 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-secret-vault
 | hosts | 允许访问的主机名，逗号分隔；**不写协议/路径/端口**，如 `api.github.com, github.com` |
 | methods | 允许的 HTTP 方法；**创建后不可改** |
 | commands | 仅 `controlled`：允许使用占位符的命令前缀，如 `git, gh` |
-| 附加字段（`meta`） | 非密钥键值，如 `account_id`、`zone_id`、`project`；会出现在 `vault_list` |
+| 附加字段（`meta`） | 非密钥键值，如 `account_id`、`zone_id`、`project`；`vault_list` 只显示字段名，不显示值 |
 | maxUses / TTL / burn | 使用次数上限 / 有效期 / 用后焚毁 |
 
 > 预设只填充创建表单；策略字段（level/auth/hosts/methods/commands）保存后**不可修改**，需要变更时删除重建。
 
 ### 附加字段与占位符
 
-Cloudflare 的 account_id、zone_id 这类**非密钥**信息可以放在「附加字段」里（键名小写，如 `account_id`），保存后：
+Cloudflare 的 account_id、zone_id 这类**非密钥**信息可以放在「附加字段」里（键名小写，如 `account_id`）。整个 vault（包括字段）在磁盘上都是 DPAPI/AES 加密的；但为了不让模型直接读到字段值，`vault_list` **只返回字段名**：
 
-- `vault_list` 会显示 `fields=account_id=...`；
-- 命令、`vault_http` 的 URL / headers / body 都可以用 `[[vault:<id>:<字段名>]]` 引用：
+- `vault_list` 显示 `fields=account_id|zone_id`（没有值）；
+- 命令、`vault_http` 的 URL / headers / body 都可以用 `[[vault:<id>:<字段名>]]` 引用字段值：
 
 ```text
 vault_http({
@@ -132,7 +132,7 @@ $env:CLOUDFLARE_API_TOKEN = '[[vault:cloudflare-deploy]]'
 wrangler pages deploy dist
 ```
 
-> 附加字段是**明文非密钥**，不要放 token/密码。Cloudflare 预设会自动加一行空 `account_id`，填上你的 Account ID 即可。
+> 附加字段的值不会出现在 `vault_list`/模型上下文里；设置页仍可查看和编辑（本地管理页）。不要放 token/密码。Cloudflare 预设会自动加一行空 `account_id`，填上你的 Account ID 即可。
 
 ---
 
