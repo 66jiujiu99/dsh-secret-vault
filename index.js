@@ -1171,7 +1171,7 @@ export function apply(ctx, rawConfig) {
                   kind: { type: 'string' }, hosts: { type: 'array', items: { type: 'string' } },
                   methods: { type: 'array', items: { type: 'string' } },
                   commands: { type: 'array', items: { type: 'string' } },
-                  meta: { type: 'object', additionalProperties: { type: 'string' } },
+                  meta: { type: 'object', additionalProperties: true },
                   masked: { type: 'string' }, useCount: { type: 'number' },
                   lastUsedAt: { type: 'string' }, expired: { type: 'boolean' },
                 },
