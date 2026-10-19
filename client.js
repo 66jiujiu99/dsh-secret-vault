@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-	id: '@local/dsh-secret-vault',
+	id: 'dsh-secret-vault',
 	factory(require) {
 		const React = require('react');
 		const h = React.createElement;
