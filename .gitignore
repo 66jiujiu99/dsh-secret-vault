@@ -1,0 +1,7 @@
+node_modules/
+*.dpapi
+vault.key
+vault.json
+.DS_Store
+Thumbs.db
+test/tmp/

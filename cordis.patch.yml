@@ -1,0 +1,12 @@
+# dsh-secret-vault bundle patch: one Host row. The browser half rides the package's dsh.client manifest.
+- insert:
+    - id: secret-vault
+      name: 'dsh-secret-vault'
+      config:
+        redactPatterns: true
+        redactUserMessages: true
+        denyPathReads: true
+        denySpillReads: true
+        maxResponseChars: 24000
+        approvalTimeoutMs: 120000
+        instructions: true

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Secret Vault">
+  <defs>
+    <linearGradient id="sv-bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1f4b8f"/>
+      <stop offset="1" stop-color="#0d1b33"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#sv-bg)"/>
+  <path d="M20 29v-4a12 12 0 0 1 24 0v4" fill="none" stroke="#9fd3ff" stroke-width="4" stroke-linecap="round"/>
+  <rect x="15" y="28" width="34" height="26" rx="7" fill="#eaf6ff"/>
+  <circle cx="32" cy="39" r="4.4" fill="#12508f"/>
+  <rect x="30.2" y="41" width="3.6" height="8" rx="1.8" fill="#12508f"/>
+</svg>

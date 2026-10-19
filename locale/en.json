@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Secret Vault",
+    "description": "Global, use-only credential vault: privacy levels, placeholder injection, sealed HTTP broker, result redaction and a read-denying guard."
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "name": "dsh-secret-vault",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness 的全局凭证保险库：能用、不能读；三级隐私等级、占位符注入、密封 HTTP 代理、结果脱敏与 guard。",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/66jiujiu99/dsh-secret-vault.git"
+  },
+  "homepage": "https://github.com/66jiujiu99/dsh-secret-vault#readme",
+  "bugs": {
+    "url": "https://github.com/66jiujiu99/dsh-secret-vault/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "credential",
+    "vault",
+    "secret",
+    "security",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}
