@@ -229,6 +229,30 @@ try {
   })
   check('save sealed item', sealed.body.ok === true && sealed.body.value.item.level === 'sealed', JSON.stringify(sealed.body))
 
+  check('vault_gh tool registered', typeof tools.vault_gh === 'object' && typeof tools.vault_gh.execute === 'function')
+  const ghSealed = await tools.vault_gh.execute(
+    { credential: 'sealed-token', args: ['--version'] },
+    { signal: new AbortController().signal },
+  ).then(() => null, (error) => error.message)
+  check('vault_gh refuses sealed credential', ghSealed !== null && ghSealed.includes('只允许 controlled'), String(ghSealed))
+  for (const [label, argv] of [
+    ['auth subcommand', ['auth', 'token']],
+    ['extension subcommand', ['extension', 'list']],
+    ['hostname flag', ['api', '/user', '--hostname', 'evil.example']],
+    ['show-token flag', ['auth', 'status', '--show-token']],
+  ]) {
+    const denied = await tools.vault_gh.execute(
+      { credential: 'test-token', args: argv },
+      { signal: new AbortController().signal },
+    ).then(() => null, (error) => error.message)
+    check(`vault_gh denies ${label}`, denied !== null && (denied.includes('不允许') || denied.includes('只允许')), String(denied))
+  }
+  const ghEmpty = await tools.vault_gh.execute(
+    { credential: 'test-token', args: [] },
+    { signal: new AbortController().signal },
+  ).then(() => null, (error) => error.message)
+  check('vault_gh rejects empty args', ghEmpty !== null && ghEmpty.includes('1-64'), String(ghEmpty))
+
   const sealedHttp = await tools.vault_http.execute(
     { id: 'sealed-token', method: 'GET', url: `http://127.0.0.1:${port}/sealed` },
     { signal: new AbortController().signal, callId: 'call-5' },

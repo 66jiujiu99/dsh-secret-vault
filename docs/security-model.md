@@ -74,6 +74,13 @@ spill / dsh-subprocess-* 文件 --> 解析通知路径、回写脱敏（仅临�
 - `vault_http` 的 host 不在凭证 hosts 内即拒绝；
 - 用 `WeakSet<exec>` 标记自己替换过的调用，避免误杀 L1 正常使用。
 
+### 托管 gh（可选）
+
+- 首次 `vault_gh` 调用从官方 `cli/cli` release 下载当前平台资产，使用 release 资产自带的 `sha256:` digest（缺失时回退到 `*_checksums.txt`）校验后解压到 `<DSH_HOME>/secret-vault/gh/<version>/`；仓库不提交二进制。
+- `args` 是 argv 数组，不经过 shell；拒绝 `extension`/`alias`/`config`/`auth` 子命令与 `--hostname`/`--show-token`。
+- token 以 `GH_TOKEN` 注入子进程环境（L1）；gh 不登录，`hosts.yml` 中没有 token。
+- 下载/校验失败时工具报错且不安装；`ghVersion` 可固定版本。
+
 ### 管理 API
 
 - loopback + POST + JSON；只读 `state` 不需要令牌；
@@ -91,9 +98,10 @@ spill / dsh-subprocess-* 文件 --> 解析通知路径、回写脱敏（仅临�
 5. **落盘通知是启发式**：从自由文本解析路径；已限制为临时目录普通文件 + realpath + 8MiB，但格式升级或伪造通知仍可能造成 DoS/误写临时文件。
 6. **Desktop 不注入页面令牌**（`tapIndex` 不生效），写操作走 JSON 兜底；令牌在 Desktop 不构成额外边界。
 7. **不阻止误删**：插件保护凭证不泄漏，不保护操作审批。需要人工把关时用 `ephemeral` 或 GitHub 侧策略。
-8. **Host 代码执行面**：`plugin_manager`、`cordis_run`、允许读本地路径的 MCP 工具都能绕过进程内 vault；此时必须使用进程外方案。
-9. **历史会话不追溯**：已持久化的明文不会被本插件回改。
+8. **托管 gh 引入外部二进制**：下载的是官方 release 并做 SHA-256 校验，但仍是供应链依赖；`GH_TOKEN` 会进子进程环境（L1）。不需要 gh 时不要调用 `vault_gh`。
+9. **Host 代码执行面**：`plugin_manager`、`cordis_run`、允许读本地路径的 MCP 工具都能绕过进程内 vault；此时必须使用进程外方案。
+10. **历史会话不追溯**：已持久化的明文不会被本插件回改。
 
 ## 6. 验证
 
-`node test/harness.mjs` 覆盖 37 项断言：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard（含 `grep.include`/`terminal_send`）、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值。
+`node test/harness.mjs` 覆盖 44 项断言：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard（含 `grep.include`/`terminal_send`）、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝。

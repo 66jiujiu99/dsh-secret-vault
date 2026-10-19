@@ -34,6 +34,7 @@
 - **管理接口加固**：loopback + POST + JSON；只读 `state` 不需要令牌，写操作在 Desktop 下走同源兜底；**等级/hosts/methods/commands 创建后不可变**，拿到管理面也无法把 `sealed` 降级成 `controlled`。
 - **一次性凭证**：`ephemeral` 每次使用都在当前会话弹出确认卡片；子代理无法人工确认，会被自动拒绝。
 - **使用计数与审计**：`maxUses`、TTL、用后焚毁；审计只记 `{at,itemId,action,sessionId,ok}`，不含参数与值。
+- **托管 gh CLI（按需下载）**：首次调用 `vault_gh` 时从官方 `cli/cli` release 下载当前平台的 gh，**校验 SHA-256** 后缓存；不把二进制提交进仓库。token 以 `GH_TOKEN` 注入子进程，配合 `--json/--jq` 输出很短。
 
 ---
 
@@ -156,6 +157,38 @@ vault_http({ id: "github-manage", method: "DELETE",
 
 ---
 
+## 托管 GH CLI（按需下载，可选）
+
+如果希望模型用 `gh` 的短输出省 token，又不想让 gh 保存 token，可以用内置的 `vault_gh`：
+
+```text
+vault_gh({
+  credential: "github-git",
+  args: ["repo", "list", "--limit", "30", "--json", "name,isPrivate", "--jq", ".[] | \"\\(.name) \\(.isPrivate)\""]
+})
+```
+
+规则：
+
+- 只接受 **`controlled`** 凭证；`sealed`/`ephemeral` 会被拒绝（因为 `GH_TOKEN` 会进子进程环境）；
+- `args` 是 argv 数组，不经过 shell；
+- 拒绝 `extension` / `alias` / `config` / `auth` 子命令，以及 `--hostname` / `--show-token`；
+- gh **不登录**：没有 `hosts.yml` token，`gh auth token` 打印不出东西；
+- 第一次调用会从 `https://github.com/cli/cli/releases` 下载当前平台的 gh，用官方 release 的 `sha256` 校验后放到 `<DSH_HOME>/secret-vault/gh/<version>/`；
+- 可用 profile patch 配置：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `ghVersion` | 空（latest） | 固定 gh 版本，如 `2.102.0` |
+| `ghDir` | `<storeDir>/gh` | gh 缓存根目录 |
+| `ghDownloadTimeoutMs` | `180000` | 下载/校验超时 |
+| `ghTimeoutMs` | `60000` | 单次 gh 执行超时 |
+| `ghMaxOutputChars` | `20000` | stdout/stderr 截断上限 |
+
+> `GH_TOKEN` 属于 L1 暴露：值会进一次子进程环境，同 UID 进程可读。高价值 PAT 不要给 `vault_gh`，请用 `vault_http`（sealed）。
+
+---
+
 ## 安全边界（必须读）
 
 这个插件能做什么、不能做什么，都是明确的：
@@ -172,7 +205,7 @@ vault_http({ id: "github-manage", method: "DELETE",
 
 - Host 内存里保存全部明文与页面令牌，同 UID 的调试器/`OpenProcess` 可直接读；
 - DPAPI 可被同用户进程解密；vault 文件可被删除/替换；
-- `controlled` 的值会进入子进程命令行/环境，WMI/进程列表可读；`curl --connect-to` 等可绕过 hosts 校验；
+- `controlled` 的值会进入子进程命令行/环境，WMI/进程列表可读；`curl --connect-to` 等可绕过 hosts 校验；`vault_gh` 的 `GH_TOKEN` 同理；
 - assistant 消息、compaction 摘要、`tool/call` 参数、PTC `tool/ptc-dispatch.arguments` 没有可用的写日志前改写缝；
 - 如果 profile 暴露 `plugin_manager`（装 Host 代码）、`cordis_run`（执行 Host JS）或允许 MCP 读取本地路径，任何进程内 vault 都可被绕过；
 - 插件**不阻止误删仓库**：它保护的是凭证不泄漏，不是操作审批。需要人工把关时用 `ephemeral`，或使用 GitHub 侧的组织策略/审计。
@@ -189,7 +222,7 @@ vault_http({ id: "github-manage", method: "DELETE",
 node test/harness.mjs
 ```
 
-覆盖：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值。
+覆盖：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝。
 
 `test/echo-server.mjs` 是本地回显服务，用于验证认证头注入与脱敏。
 

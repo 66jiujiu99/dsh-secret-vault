@@ -10,3 +10,7 @@
         maxResponseChars: 24000
         approvalTimeoutMs: 120000
         instructions: true
+        ghVersion: ''
+        ghDownloadTimeoutMs: 180000
+        ghTimeoutMs: 60000
+        ghMaxOutputChars: 20000
