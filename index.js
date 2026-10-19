@@ -29,6 +29,7 @@ const LEVELS = ['controlled', 'sealed', 'ephemeral']
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']
 const AUTH_TYPES = ['bearer', 'basic', 'header', 'query']
 const PLACEHOLDER_RE = /\[\[vault:([a-z0-9][a-z0-9._-]{0,63})\]\]/g
+const META_PLACEHOLDER_RE = /\[\[vault:([a-z0-9][a-z0-9._-]{0,63}):([a-z0-9][a-z0-9._-]{0,63})\]\]/g
 const SUBSTITUTABLE_TOOLS = new Set(['bash', 'pwsh'])
 const FORBIDDEN_REQUEST_HEADERS = new Set([
   'authorization', 'proxy-authorization', 'cookie', 'host', 'content-length',
@@ -78,6 +79,24 @@ function messageOf(error) {
 function cleanString(value, max) {
   if (typeof value !== 'string') return ''
   return value.trim().slice(0, max)
+}
+
+/** Non-secret per-credential fields (Cloudflare account_id, zone_id, ...). */
+function normalizeMeta(value) {
+  const out = {}
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return out
+  let count = 0
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    if (count >= 32) break
+    const key = String(rawKey ?? '').trim().toLowerCase()
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) continue
+    if (typeof rawValue !== 'string') continue
+    const text = rawValue.trim().slice(0, 512)
+    if (text === '') continue
+    out[key] = text
+    count += 1
+  }
+  return out
 }
 
 function toInt(value, fallback, min, max) {
@@ -681,6 +700,7 @@ export function apply(ctx, rawConfig) {
       ttlMinutes: toInt(raw.ttlMinutes, 0, 0, 525600),
       burnAfterUse: raw.burnAfterUse === true,
       secret: typeof raw.secret === 'string' ? raw.secret : '',
+      meta: normalizeMeta(raw.meta),
       createdAt: cleanString(raw.createdAt, 40) || new Date().toISOString(),
       updatedAt: cleanString(raw.updatedAt, 40) || new Date().toISOString(),
       useCount: toInt(raw.useCount, 0, 0, 1000000000),
@@ -1034,6 +1054,7 @@ export function apply(ctx, rawConfig) {
       maxUses: item.maxUses,
       ttlMinutes: item.ttlMinutes,
       burnAfterUse: item.burnAfterUse,
+      meta: { ...(item.meta || {}) },
       masked: maskSecret(item.secret),
       hasSecret: typeof item.secret === 'string' && item.secret !== '',
       useCount: item.useCount,
@@ -1062,12 +1083,39 @@ export function apply(ctx, rawConfig) {
     if (!SUBSTITUTABLE_TOOLS.has(exec.name)) return null
     const args = exec.arguments
     if (args === null || typeof args !== 'object') return null
-    const command = typeof args.command === 'string' ? args.command : ''
-    if (!command.includes('[[vault:')) return null
+    const initialCommand = typeof args.command === 'string' ? args.command : ''
+    if (!initialCommand.includes('[[vault:')) return null
     await ensureLoaded()
+
+    // Non-secret fields first: [[vault:<id>:<field>]] works for any level.
+    let missingMeta = null
+    const withMeta = replaceStrings(args, (text) => text.replace(META_PLACEHOLDER_RE, (whole, refId, key) => {
+      const item = data.items[refId]
+      if (!item) {
+        missingMeta = `未知凭证 id：${refId}`
+        return whole
+      }
+      const value = item.meta?.[key]
+      if (typeof value !== 'string' || value === '') {
+        missingMeta = `凭证 ${refId} 没有字段 ${key}；请先在设置页的「附加字段」里填写`
+        return whole
+      }
+      return value
+    }))
+    if (missingMeta !== null) return { deny: missingMeta }
+    const command = typeof withMeta.command === 'string' ? withMeta.command : ''
+    if (command.match(META_PLACEHOLDER_RE) !== null) return { deny: '命令里还有未解析的字段占位符' }
+
     const uniqueIds = new Set()
     for (const match of command.matchAll(PLACEHOLDER_RE)) uniqueIds.add(match[1])
-    if (uniqueIds.size === 0) return null
+    if (uniqueIds.size === 0) {
+      try {
+        exec.arguments = withMeta
+      } catch (error) {
+        return { deny: `无法写入字段占位符（${messageOf(error)}）` }
+      }
+      return null
+    }
     const replacements = new Map()
     for (const id of uniqueIds) {
       const item = data.items[id]
@@ -1089,7 +1137,7 @@ export function apply(ctx, rawConfig) {
       }
       replacements.set(id, item)
     }
-    const nextArgs = replaceStrings(args, (text) => text.replace(PLACEHOLDER_RE, (whole, id) => {
+    const nextArgs = replaceStrings(withMeta, (text) => text.replace(PLACEHOLDER_RE, (whole, id) => {
       const item = replacements.get(id)
       return item === undefined ? whole : item.secret
     }))
@@ -1123,6 +1171,7 @@ export function apply(ctx, rawConfig) {
                   kind: { type: 'string' }, hosts: { type: 'array', items: { type: 'string' } },
                   methods: { type: 'array', items: { type: 'string' } },
                   commands: { type: 'array', items: { type: 'string' } },
+                  meta: { type: 'object', additionalProperties: { type: 'string' } },
                   masked: { type: 'string' }, useCount: { type: 'number' },
                   lastUsedAt: { type: 'string' }, expired: { type: 'boolean' },
                 },
@@ -1142,11 +1191,15 @@ export function apply(ctx, rawConfig) {
             if (item.hosts?.length) bits.push(`hosts=${item.hosts.join('|')}`)
             if (item.methods?.length) bits.push(`methods=${item.methods.join('|')}`)
             if (item.commands?.length) bits.push(`commands=${item.commands.join('|')}`)
+            if (item.meta && typeof item.meta === 'object') {
+              const fields = Object.entries(item.meta).map(([key, value]) => `${key}=${value}`)
+              if (fields.length > 0) bits.push(`fields=${fields.join(',')}`)
+            }
             bits.push(`used=${item.useCount ?? 0}`)
             if (item.expired) bits.push('EXPIRED')
             return bits.join(' ')
           })
-          return [{ type: 'text', text: [`可用凭证（只显示元数据）：`, ...lines, '', '用法：vault_http({ id, method, url, headers?, body? })；controlled 等级可在 bash/pwsh 命令中写 [[vault:<id>]] 占位符。'].join('\n') }]
+          return [{ type: 'text', text: [`可用凭证（只显示元数据）：`, ...lines, '', '用法：vault_http({ id, method, url, headers?, body? })；controlled 等级可在 bash/pwsh 命令中写 [[vault:<id>]] 占位符；非密钥字段用 [[vault:<id>:<字段名>]]。'].join('\n') }]
         },
       },
       async execute() {
@@ -1215,9 +1268,18 @@ export function apply(ctx, rawConfig) {
           const method = cleanString(String(args.method ?? ''), 8).toUpperCase()
           if (!HTTP_METHODS.includes(method)) throw new Error(`不支持的 HTTP 方法：${method}`)
           if (!item.methods.includes(method)) throw new Error(`凭证 ${item.id} 不允许方法 ${method}；允许：${item.methods.join(', ')}`)
+          const replaceMeta = (text) => (typeof text === 'string'
+            ? text.replace(META_PLACEHOLDER_RE, (whole, refId, key) => {
+              if (refId !== item.id) return whole
+              const value = item.meta?.[key]
+              return typeof value === 'string' && value !== '' ? value : whole
+            })
+            : text)
+          const rawUrl = replaceMeta(String(args.url ?? ''))
+          if (rawUrl.includes('[[vault:')) throw new Error('URL 中还有未解析的字段占位符；请先在凭证的附加字段里填写')
           let url
           try {
-            url = new URL(String(args.url ?? ''))
+            url = new URL(rawUrl)
           } catch {
             throw new Error('url 不是合法 URL')
           }
@@ -1242,7 +1304,9 @@ export function apply(ctx, rawConfig) {
             if (FORBIDDEN_REQUEST_HEADERS.has(lowerName) || lowerName.startsWith('x-forwarded-')) {
               throw new Error(`不允许自行设置请求头 ${headerName}；认证头由 vault 注入`)
             }
-            headers.set(headerName, String(value ?? ''))
+            const valueText = replaceMeta(String(value ?? ''))
+            if (valueText.includes('[[vault:')) throw new Error(`请求头 ${headerName} 中还有未解析的字段占位符`)
+            headers.set(headerName, valueText)
           }
           const auth = item.auth ?? { type: 'bearer' }
           if (auth.type === 'bearer') headers.set('authorization', `Bearer ${item.secret}`)
@@ -1267,6 +1331,10 @@ export function apply(ctx, rawConfig) {
             }
           }
 
+          const bodyText = method === 'GET' || method === 'HEAD'
+            ? undefined
+            : (typeof args.body === 'string' ? replaceMeta(args.body) : undefined)
+          if (typeof bodyText === 'string' && bodyText.includes('[[vault:')) throw new Error('请求体里还有未解析的字段占位符')
           const controller = new AbortController()
           const abort = () => controller.abort()
           const timer = setTimeout(() => controller.abort(), config.httpTimeoutMs)
@@ -1282,7 +1350,7 @@ export function apply(ctx, rawConfig) {
             response = await fetch(url, {
               method,
               headers,
-              body: method === 'GET' || method === 'HEAD' ? undefined : (typeof args.body === 'string' ? args.body : undefined),
+              body: bodyText,
               redirect: 'manual',
               signal: controller.signal,
             })
@@ -1536,6 +1604,7 @@ export function apply(ctx, rawConfig) {
           '- `vault_http({ id, method, url, headers?, body? })` performs one HTTP request with the secret injected by the vault. The host and method must be allowed by that credential; redirects are not followed; the response is bounded and scrubbed.',
           '- `vault_gh({ credential, args })` runs the managed GitHub CLI (`gh`) with a controlled credential injected as GH_TOKEN. gh is downloaded on first use from the official cli/cli release and verified by SHA-256; `args` is an argv array, and `--json`/`--jq` keep output small. sealed/ephemeral credentials are refused.',
           '- For a `controlled` credential you may also write the placeholder `[[vault:<id>]]` inside a bash/pwsh command; the vault replaces it just before execution while the session log keeps the placeholder. `sealed` and `ephemeral` credentials must use `vault_http`.',
+          '- Non-secret fields stored on a credential (for example `account_id` for Cloudflare) are shown by `vault_list` and can be referenced as `[[vault:<id>:<field>]]` in a bash/pwsh command, in a `vault_http` URL, or in its headers/body.',
           '- `ephemeral` credentials ask the user for confirmation on every use.',
           '- Never ask the user to paste a secret into chat. If a use is denied, report the denial reason and suggest the user adjust the credential policy in Settings → Secret Vault.',
         ].join('\n'),
@@ -1616,6 +1685,7 @@ export function apply(ctx, rawConfig) {
     const candidate = data.items[cleanString(String(params?.id ?? ''), 64).toLowerCase()]
     const input = prepareItemInput(params, candidate)
     const secret = typeof params?.secret === 'string' ? params.secret : ''
+    const meta = params?.meta === undefined ? undefined : normalizeMeta(params.meta)
     const existing = candidate
     const now = new Date().toISOString()
     if (existing === undefined) {
@@ -1625,6 +1695,7 @@ export function apply(ctx, rawConfig) {
       data.items[input.id] = normalizeItem({
         ...input,
         secret,
+        meta: meta || {},
         maxUses: toInt(params?.maxUses, 0, 0, 100000),
         ttlMinutes: toInt(params?.ttlMinutes, 0, 0, 525600),
         burnAfterUse: params?.burnAfterUse === true,
@@ -1646,6 +1717,7 @@ export function apply(ctx, rawConfig) {
         ...existing,
         label: input.label,
         kind: input.kind,
+        meta: meta === undefined ? existing.meta : meta,
         secret: nextSecret,
         maxUses,
         ttlMinutes,

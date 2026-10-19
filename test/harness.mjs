@@ -147,6 +147,7 @@ try {
     id: 'test-token', label: '测试 PAT', level: 'controlled', kind: 'token',
     secret: SECRET, hosts: ['127.0.0.1', 'api.github.com'], methods: ['GET', 'POST'],
     commands: ['curl', 'git'], maxUses: 0, ttlMinutes: 0,
+    meta: { account_id: 'acct-123' },
   })
   check('save controlled item', saved.body.ok === true && saved.body.value.item.masked.includes('字符'), JSON.stringify(saved.body))
   check('save never echoes secret', JSON.stringify(saved.body).includes(SECRET) === false)
@@ -179,6 +180,7 @@ try {
 
   const list = await tools.vault_list.execute({}, {})
   check('vault_list hides secret', JSON.stringify(list).includes(SECRET) === false && list.items.length === 1)
+  check('vault_list exposes non-secret fields', JSON.stringify(list).includes('acct-123'), JSON.stringify(list))
   const listRender = JSON.stringify(tools.vault_list.output.render({}, list))
   check('vault_list render hides secret', listRender.includes(SECRET) === false && listRender.includes('test-token'))
 
@@ -189,6 +191,20 @@ try {
   check('vault_http injects bearer header', http1.status === 200 && http1.body.includes('Bearer'), JSON.stringify(http1).slice(0, 300))
   check('vault_http redacts echoed secret', http1.body.includes(SECRET) === false && http1.body.includes('[[vault:test-token]]'), http1.body)
   check('vault_http marks redacted', http1.redacted === true)
+
+  const metaHttp = await tools.vault_http.execute(
+    { id: 'test-token', method: 'GET', url: `http://127.0.0.1:${port}/[[vault:test-token:account_id]]` },
+    { signal: new AbortController().signal, callId: 'call-meta' },
+  )
+  check('vault_http expands non-secret field in URL', metaHttp.status === 200 && metaHttp.body.includes('/acct-123'), metaHttp.body)
+
+  const metaExec = {
+    name: 'bash', callId: 'call-meta-command',
+    arguments: { command: 'echo [[vault:test-token:account_id]]' },
+    signal: new AbortController().signal,
+  }
+  const metaPre = await handlers['tools/pre-execute'](metaExec, async () => ({ kind: 'allow' }))
+  check('command expands non-secret field', metaPre.kind === 'allow' && metaExec.arguments.command.includes('acct-123'), JSON.stringify(metaPre))
 
   const deniedHost = await tools.vault_http.execute(
     { id: 'test-token', method: 'GET', url: 'http://evil.example.com/x' },

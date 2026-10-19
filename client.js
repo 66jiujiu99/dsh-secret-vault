@@ -62,15 +62,18 @@ window.__ModuleLoader__.load({
 				id: 'cloudflare-api', labelKey: 'preset.cloudflare-api', itemId: 'cloudflare-api', level: 'sealed',
 				kind: 'cloud', authType: 'bearer', hosts: 'api.cloudflare.com',
 				methods: ['GET', 'POST', 'PATCH', 'DELETE'], commands: '',
+				meta: { account_id: '' },
 			},
 			{
 				id: 'cloudflare-wrangler', labelKey: 'preset.cloudflare-wrangler', itemId: 'cloudflare-deploy', level: 'controlled',
 				kind: 'cloud', authType: 'bearer', hosts: 'api.cloudflare.com',
 				methods: ['GET'], commands: '$env:cloudflare_api_token, wrangler',
+				meta: { account_id: '' },
 			},
 			{
 				id: 'cloud-api', labelKey: 'preset.cloud-api', itemId: 'cloud-api', level: 'sealed',
 				kind: 'cloud', authType: 'bearer', hosts: '', methods: ['GET', 'POST'], commands: '',
+				meta: { account_id: '' },
 			},
 		];
 
@@ -344,6 +347,16 @@ window.__ModuleLoader__.load({
   gap: 8px;
   flex-wrap: wrap;
 }
+.sv-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.sv-meta-row .sv-input {
+  flex: 1;
+  min-width: 0;
+}
 .sv-note {
   margin: 0;
   padding-top: 2px;
@@ -493,6 +506,15 @@ window.__ModuleLoader__.load({
 			'form.commands': '允许的命令前缀',
 			'form.commandsPlaceholder': 'git, gh, npm（逗号分隔）',
 			'form.commandsHint': '仅受控等级用占位符时校验；留空表示不限制（不推荐）。',
+			'form.fields': '附加字段（非密钥）',
+			'form.fieldsHint': '例如 Cloudflare 的 account_id；字段会出现在 vault_list，并可在命令/URL 中用 [[vault:<id>:<字段名>]] 引用。不要放密钥。',
+			'form.fieldKey': '字段名（如 account_id）',
+			'form.fieldValue': '值',
+			'form.addField': '+ 添加字段',
+			'form.removeField': '删除',
+			'error.metaKey': '字段名必须以小写字母/数字开头，只含 a-z 0-9 . _ -',
+			'error.metaDup': '字段名不能重复',
+			'error.metaValue': '字段值最长 512 字符',
 			'form.maxUses': '使用次数上限',
 			'form.maxUsesHint': '0 表示不限制',
 			'form.ttl': '有效期（分钟）',
@@ -619,6 +641,15 @@ window.__ModuleLoader__.load({
 			'form.commands': 'Allowed command prefixes',
 			'form.commandsPlaceholder': 'git, gh, npm (comma separated)',
 			'form.commandsHint': 'Checked only for controlled placeholders; empty means no restriction (not recommended).',
+			'form.fields': 'Additional fields (non-secret)',
+			'form.fieldsHint': 'For example Cloudflare account_id. Fields appear in vault_list and can be referenced as [[vault:<id>:<field>]] in commands, URLs, headers or bodies. Never put secrets here.',
+			'form.fieldKey': 'Field name (e.g. account_id)',
+			'form.fieldValue': 'Value',
+			'form.addField': '+ Add field',
+			'form.removeField': 'Remove',
+			'error.metaKey': 'Field name must start with a lowercase letter or digit and contain only a-z 0-9 . _ -',
+			'error.metaDup': 'Field names must be unique',
+			'error.metaValue': 'A field value can be at most 512 characters',
 			'form.maxUses': 'Use limit',
 			'form.maxUsesHint': '0 means unlimited',
 			'form.ttl': 'TTL (minutes)',
@@ -776,6 +807,7 @@ window.__ModuleLoader__.load({
 				hosts: '',
 				methods: ['GET'],
 				commands: '',
+				metaRows: [],
 				maxUses: '0',
 				ttlMinutes: '0',
 				burnAfterUse: false,
@@ -800,6 +832,7 @@ window.__ModuleLoader__.load({
 				hosts: Array.isArray(item.hosts) ? item.hosts.map(String).join(', ') : '',
 				methods,
 				commands: Array.isArray(item.commands) ? item.commands.map(String).join(', ') : '',
+				metaRows: Object.entries(item.meta && typeof item.meta === 'object' ? item.meta : {}).map(([key, value]) => ({ key, value: String(value) })),
 				maxUses: typeof item.maxUses === 'number' && Number.isFinite(item.maxUses) ? String(item.maxUses) : '0',
 				ttlMinutes: typeof item.ttlMinutes === 'number' && Number.isFinite(item.ttlMinutes) ? String(item.ttlMinutes) : '0',
 				burnAfterUse: item.burnAfterUse === true,
@@ -821,6 +854,16 @@ window.__ModuleLoader__.load({
 			if (form.authType === 'header' && form.authName.trim() === '') return t('error.authName');
 			if (form.authType === 'query' && form.authName.trim() === '') return t('error.authName');
 			if (form.authType === 'basic' && form.authUsername.trim() === '') return t('error.authUsername');
+			const metaKeys = new Set();
+			for (const row of form.metaRows || []) {
+				const key = String(row && row.key ? row.key : '').trim().toLowerCase();
+				const value = String(row && row.value ? row.value : '');
+				if (key === '' && value.trim() === '') continue;
+				if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(key)) return t('error.metaKey');
+				if (metaKeys.has(key)) return t('error.metaDup');
+				if (value.length > 512) return t('error.metaValue');
+				metaKeys.add(key);
+			}
 			return null;
 		}
 
@@ -830,6 +873,12 @@ window.__ModuleLoader__.load({
 			const authName = form.authType === 'header' || form.authType === 'query' ? form.authName.trim() : '';
 			const username = form.authType === 'basic' ? form.authUsername.trim() : '';
 			const chosen = HTTP_METHODS.filter((method) => form.methods.indexOf(method) !== -1);
+			const meta = {};
+			for (const row of form.metaRows || []) {
+				const key = String(row && row.key ? row.key : '').trim().toLowerCase();
+				const value = String(row && row.value ? row.value : '').trim();
+				if (key !== '' && value !== '') meta[key] = value.slice(0, 512);
+			}
 			const params = {
 				id: form.id.trim(),
 				label: form.label.trim(),
@@ -843,6 +892,7 @@ window.__ModuleLoader__.load({
 				hosts: parseList(form.hosts),
 				methods: chosen.length > 0 ? chosen : form.methods.slice(),
 				commands: controlled ? parseList(form.commands) : [],
+				meta,
 				maxUses: toCount(form.maxUses) === null ? 0 : toCount(form.maxUses),
 				ttlMinutes: toCount(form.ttlMinutes) === null ? 0 : toCount(form.ttlMinutes),
 				burnAfterUse: ephemeral ? form.burnAfterUse === true : false,
@@ -981,9 +1031,30 @@ window.__ModuleLoader__.load({
 					hosts: preset.hosts,
 					methods: [...preset.methods],
 					commands: preset.commands,
+					metaRows: Object.entries(preset.meta || {}).map(([key, value]) => ({ key, value: String(value) })),
 					maxUses: preset.maxUses || '0',
 					ttlMinutes: preset.ttlMinutes || '0',
 					burnAfterUse: false,
+				}));
+			};
+
+			const addMetaRow = () => {
+				setForm((current) => Object.assign({}, current, {
+					metaRows: (current.metaRows || []).concat([{ key: '', value: '' }]),
+				}));
+			};
+
+			const updateMetaRow = (index, part, value) => {
+				setForm((current) => {
+					const rows = (current.metaRows || []).slice();
+					rows[index] = Object.assign({}, rows[index], { [part]: value });
+					return Object.assign({}, current, { metaRows: rows });
+				});
+			};
+
+			const removeMetaRow = (index) => {
+				setForm((current) => Object.assign({}, current, {
+					metaRows: (current.metaRows || []).filter((_row, rowIndex) => rowIndex !== index),
 				}));
 			};
 
@@ -1167,6 +1238,30 @@ window.__ModuleLoader__.load({
 							placeholder: t('form.commandsPlaceholder'),
 						}, 'sv-hint-commands'), t('form.commandsHint'), true)
 						: null,
+					h('div', { className: 'sv-field sv-field--wide', key: 'meta' },
+						h('span', { className: 'sv-label' }, t('form.fields')),
+						(form.metaRows || []).map((row, index) => h('div', { className: 'sv-meta-row', key: 'meta-' + index },
+							h('input', {
+								className: 'sv-input',
+								value: row.key,
+								placeholder: t('form.fieldKey'),
+								onChange: (event) => updateMetaRow(index, 'key', event.target.value),
+							}),
+							h('input', {
+								className: 'sv-input',
+								value: row.value,
+								placeholder: t('form.fieldValue'),
+								onChange: (event) => updateMetaRow(index, 'value', event.target.value),
+							}),
+							h('button', {
+								type: 'button',
+								className: 'sv-btn sv-btn--sm',
+								onClick: () => removeMetaRow(index),
+							}, t('form.removeField')),
+						)),
+						h('button', { type: 'button', className: 'sv-btn sv-btn--sm', onClick: addMetaRow }, t('form.addField')),
+						h('span', { className: 'sv-hint' }, t('form.fieldsHint')),
+					),
 					field('maxUses', t('form.maxUses'), textInput('maxUses', form.maxUses, (value) => patch({ maxUses: value }), {
 						inputMode: 'numeric',
 						autoComplete: 'off',
