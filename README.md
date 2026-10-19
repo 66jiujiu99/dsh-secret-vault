@@ -81,6 +81,18 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-secret-vault
 
 > Desktop 版不会注入页面令牌，管理接口对写操作使用「loopback + JSON」兜底；如果刚安装/升级，刷新一次页面（Desktop 可 `Ctrl+R` 或退出重开）即可。
 
+新增表单顶部有 **预设**，选中后会自动填好等级、认证方式、hosts、methods（controlled 还会填 commands）；你只需要再填凭证值：
+
+| 预设 | 自动填充 |
+|---|---|
+| 自定义 | 空白表单 |
+| GitHub API · 只读 | sealed / bearer / `api.github.com` / `GET` |
+| GitHub API · 建删仓 | sealed / bearer / `api.github.com` / `GET,POST,PATCH,DELETE` |
+| GitHub CLI / git | controlled / `github.com, api.github.com` / commands `$env:gh_token, gh, git` |
+| Cloudflare API | sealed / cloud / bearer / `api.cloudflare.com` / 全部方法 |
+| Cloudflare Wrangler 部署 | controlled / cloud / `api.cloudflare.com` / commands `$env:cloudflare_api_token, wrangler` |
+| 通用 Cloud API | sealed / cloud / bearer / 空白 hosts（自定义域名） |
+
 新增一条凭证：
 
 | 字段 | 说明 |
@@ -88,6 +100,7 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-secret-vault
 | `id` | 小写字母/数字/`._-`，用于 `[[vault:id]]` 与 `vault_http` |
 | `label` | 给模型看的用途说明（不要写 secret） |
 | `level` | `controlled` / `sealed` / `ephemeral` |
+| `kind` | `token` / `api-key` / `password` / `cookie` / `cloud` / `other` |
 | `secret` | 至少 8 字符；保存后不可再查看 |
 | 认证方式 | `bearer` / `basic` / `header`（自定义头名）/ `query`（自定义参数名） |
 | hosts | 允许访问的主机名，逗号分隔；**不写协议/路径/端口**，如 `api.github.com, github.com` |
@@ -95,7 +108,7 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-secret-vault
 | commands | 仅 `controlled`：允许使用占位符的命令前缀，如 `git, gh` |
 | maxUses / TTL / burn | 使用次数上限 / 有效期 / 用后焚毁 |
 
-> 策略字段（level/auth/hosts/methods/commands）创建后**不可修改**；需要变更时删除重建。secret 可以随时轮换（编辑时留空=不变，填新值=覆盖）。
+> 预设只填充创建表单；策略字段（level/auth/hosts/methods/commands）保存后**不可修改**，需要变更时删除重建。
 
 ---
 

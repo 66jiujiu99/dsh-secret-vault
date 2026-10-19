@@ -32,6 +32,47 @@ window.__ModuleLoader__.load({
 
 		const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
 		const AUTH_TYPES = ['bearer', 'basic', 'header', 'query'];
+		const KINDS = ['token', 'api-key', 'password', 'cookie', 'cloud', 'other'];
+
+		/**
+		 * Create-time presets. They only prefill the form; the user still supplies
+		 * the secret, and policy fields stay immutable after the first save.
+		 */
+		const PRESETS = [
+			{
+				id: 'custom', labelKey: 'preset.custom', itemId: '', level: 'controlled',
+				kind: 'token', authType: 'bearer', hosts: '', methods: ['GET'], commands: '',
+			},
+			{
+				id: 'github-read', labelKey: 'preset.github-read', itemId: 'github-read', level: 'sealed',
+				kind: 'token', authType: 'bearer', hosts: 'api.github.com', methods: ['GET'], commands: '',
+				maxUses: '0', ttlMinutes: '0',
+			},
+			{
+				id: 'github-manage', labelKey: 'preset.github-manage', itemId: 'github-manage', level: 'sealed',
+				kind: 'token', authType: 'bearer', hosts: 'api.github.com',
+				methods: ['GET', 'POST', 'PATCH', 'DELETE'], commands: '',
+			},
+			{
+				id: 'github-cli', labelKey: 'preset.github-cli', itemId: 'github-git', level: 'controlled',
+				kind: 'token', authType: 'bearer', hosts: 'github.com, api.github.com',
+				methods: ['GET'], commands: '$env:gh_token, gh, git',
+			},
+			{
+				id: 'cloudflare-api', labelKey: 'preset.cloudflare-api', itemId: 'cloudflare-api', level: 'sealed',
+				kind: 'cloud', authType: 'bearer', hosts: 'api.cloudflare.com',
+				methods: ['GET', 'POST', 'PATCH', 'DELETE'], commands: '',
+			},
+			{
+				id: 'cloudflare-wrangler', labelKey: 'preset.cloudflare-wrangler', itemId: 'cloudflare-deploy', level: 'controlled',
+				kind: 'cloud', authType: 'bearer', hosts: 'api.cloudflare.com',
+				methods: ['GET'], commands: '$env:cloudflare_api_token, wrangler',
+			},
+			{
+				id: 'cloud-api', labelKey: 'preset.cloud-api', itemId: 'cloud-api', level: 'sealed',
+				kind: 'cloud', authType: 'bearer', hosts: '', methods: ['GET', 'POST'], commands: '',
+			},
+		];
 
 		/** Every privacy level, its badge label key and its one-line explanation key. */
 		const LEVELS = [
@@ -411,6 +452,21 @@ window.__ModuleLoader__.load({
 			'form.editTitle': '编辑凭证',
 			'form.editHint': '凭证值不会回显；留空表示继续使用现有值，填写新值即轮换。',
 			'form.policyLocked': '等级、认证方式、hosts、methods、commands 创建后不可修改；如需变更请删除后重建。',
+			'form.preset': '预设',
+			'form.presetHint': '选择 GitHub / Cloudflare 等预设会自动填好等级、认证方式、hosts、methods；保存后策略字段不可再改。',
+			'kind.token': 'token',
+			'kind.api-key': 'api-key',
+			'kind.password': 'password',
+			'kind.cookie': 'cookie',
+			'kind.cloud': 'cloud（云服务）',
+			'kind.other': 'other',
+			'preset.custom': '自定义',
+			'preset.github-read': 'GitHub API · 只读（sealed）',
+			'preset.github-manage': 'GitHub API · 建/删仓（sealed）',
+			'preset.github-cli': 'GitHub CLI / git（controlled）',
+			'preset.cloudflare-api': 'Cloudflare API（sealed）',
+			'preset.cloudflare-wrangler': 'Cloudflare Wrangler 部署（controlled）',
+			'preset.cloud-api': '通用 Cloud API（sealed，自定义域名）',
 			'form.id': 'ID',
 			'form.idHint': '小写字母或数字开头，只含 a-z 0-9 . _ -，最长 64 位；保存后不可修改',
 			'form.label': '名称',
@@ -522,6 +578,21 @@ window.__ModuleLoader__.load({
 			'form.editTitle': 'Edit credential',
 			'form.editHint': 'The value is never echoed; leave it empty to keep the current value, or enter a new value to rotate.',
 			'form.policyLocked': 'Level, authentication, hosts, methods and commands are immutable after creation; delete and recreate to change them.',
+			'form.preset': 'Preset',
+			'form.presetHint': 'Presets fill level, auth, hosts and methods for GitHub / Cloudflare / generic cloud; policy fields stay immutable after saving.',
+			'kind.token': 'token',
+			'kind.api-key': 'api-key',
+			'kind.password': 'password',
+			'kind.cookie': 'cookie',
+			'kind.cloud': 'cloud',
+			'kind.other': 'other',
+			'preset.custom': 'Custom',
+			'preset.github-read': 'GitHub API · read-only (sealed)',
+			'preset.github-manage': 'GitHub API · repo create/delete (sealed)',
+			'preset.github-cli': 'GitHub CLI / git (controlled)',
+			'preset.cloudflare-api': 'Cloudflare API (sealed)',
+			'preset.cloudflare-wrangler': 'Cloudflare Wrangler deploy (controlled)',
+			'preset.cloud-api': 'Generic Cloud API (sealed, custom hosts)',
 			'form.id': 'ID',
 			'form.idHint': 'Starts with a lowercase letter or digit; only a-z 0-9 . _ - (max 64); immutable after saving',
 			'form.label': 'Name',
@@ -693,6 +764,7 @@ window.__ModuleLoader__.load({
 		 * ------------------------------------------------------------------ */
 		function blankForm() {
 			return {
+				preset: 'custom',
 				id: '',
 				label: '',
 				level: 'controlled',
@@ -716,6 +788,7 @@ window.__ModuleLoader__.load({
 				? item.methods.map((method) => String(method).toUpperCase())
 				: ['GET'];
 			return {
+				preset: 'custom',
 				id: typeof item.id === 'string' ? item.id : '',
 				label: typeof item.label === 'string' ? item.label : '',
 				level: normalizeLevel(item.level),
@@ -889,6 +962,31 @@ window.__ModuleLoader__.load({
 				setForm((current) => Object.assign({}, current, changes));
 			};
 
+			const applyPreset = (presetId) => {
+				const preset = PRESETS.find((entry) => entry.id === presetId);
+				if (preset === undefined) return;
+				if (preset.id === 'custom') {
+					setForm((current) => Object.assign(blankForm(), { preset: 'custom', secret: current.secret }));
+					return;
+				}
+				setForm((current) => Object.assign({}, current, {
+					preset: preset.id,
+					id: preset.itemId || current.id,
+					label: t(preset.labelKey),
+					level: preset.level,
+					kind: preset.kind,
+					authType: preset.authType,
+					authName: '',
+					authUsername: '',
+					hosts: preset.hosts,
+					methods: [...preset.methods],
+					commands: preset.commands,
+					maxUses: preset.maxUses || '0',
+					ttlMinutes: preset.ttlMinutes || '0',
+					burnAfterUse: false,
+				}));
+			};
+
 			const toggleMethod = (method) => {
 				setForm((current) => {
 					const selected = current.methods.indexOf(method) !== -1;
@@ -939,6 +1037,7 @@ window.__ModuleLoader__.load({
 
 			const authHint = t('form.authHint.' + form.authType);
 			const levelMeta = LEVEL_BY_ID[form.level];
+			const kindOptions = KINDS.indexOf(form.kind) === -1 ? KINDS.concat([form.kind]) : KINDS;
 
 			return h('form', {
 				className: 'sv-form',
@@ -951,6 +1050,16 @@ window.__ModuleLoader__.load({
 					editing ? h('p', { className: 'sv-hint sv-form-hint' }, t('form.editHint')) : null,
 				),
 				h('div', { className: 'sv-grid' },
+					editing ? null : h('div', { className: 'sv-field sv-field--wide', key: 'preset' },
+						h('label', { className: 'sv-label', htmlFor: 'sv-field-preset' }, t('form.preset')),
+						h('select', {
+							id: 'sv-field-preset',
+							className: 'sv-select',
+							value: form.preset,
+							onChange: (event) => applyPreset(event.target.value),
+						}, PRESETS.map((preset) => h('option', { key: preset.id, value: preset.id }, t(preset.labelKey)))),
+						h('span', { className: 'sv-hint' }, t('form.presetHint')),
+					),
 					field('id', t('form.id'), textInput('id', form.id, (value) => patch({ id: value }), {
 						readOnly: editing,
 						autoComplete: 'off',
@@ -986,10 +1095,12 @@ window.__ModuleLoader__.load({
 						),
 						editing ? h('p', { className: 'sv-hint' }, t('form.policyLocked')) : null,
 					),
-					field('kind', t('form.kind'), textInput('kind', form.kind, (value) => patch({ kind: value }), {
-						autoComplete: 'off',
-						placeholder: t('form.kindPlaceholder'),
-					}), null, false),
+					field('kind', t('form.kind'), h('select', {
+						id: 'sv-field-kind',
+						className: 'sv-select',
+						value: form.kind,
+						onChange: (event) => patch({ kind: event.target.value }),
+					}, kindOptions.map((kind) => h('option', { key: kind, value: kind }, t('kind.' + kind)))), null, false),
 					field('secret', t('form.secret'), h('input', {
 						id: 'sv-field-secret',
 						className: 'sv-input',

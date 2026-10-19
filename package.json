@@ -1,6 +1,6 @@
 {
   "name": "dsh-secret-vault",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "DeepSeek Harness 的全局凭证保险库：能用、不能读；三级隐私等级、占位符注入、密封 HTTP 代理、结果脱敏与 guard。",
   "type": "module",
