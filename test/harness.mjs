@@ -152,6 +152,28 @@ try {
   check('save controlled item', saved.body.ok === true && saved.body.value.item.masked.includes('字符'), JSON.stringify(saved.body))
   check('save never echoes secret', JSON.stringify(saved.body).includes(SECRET) === false)
 
+  // ── 回归：`state` 不得下发 meta 的**值**（2026-10-24 审计修复）────────────
+  // 原来 vaultState() 直接 `itemMeta`，而 itemMeta 带 `meta: {...}` 的值，
+  // 于是管理 API 会把 cloudflare 的 account_id 之类下发——与系统提示
+  // 「values stay hidden」直接矛盾。vault_list 有 delete，state 没有。
+  const stateForMeta = await callApi('state')
+  const metaItem = (stateForMeta.body.value?.items ?? []).find((item) => item.id === 'test-token')
+  check('state 仍能列出 items', metaItem !== undefined, JSON.stringify(stateForMeta.body.value?.items?.map((i) => i.id)))
+  check(
+    'state 不下发 meta 的值（只给字段名）',
+    metaItem !== undefined
+      && JSON.stringify(metaItem.meta ?? {}).includes('acct-123') === false
+      && JSON.stringify(metaItem).includes('acct-123') === false,
+    JSON.stringify(metaItem ?? {}).slice(0, 200),
+  )
+  check(
+    'state 给出字段名',
+    metaItem !== undefined
+      && Array.isArray(metaItem.fields)
+      && metaItem.fields.includes('account_id'),
+    JSON.stringify(metaItem?.fields ?? []),
+  )
+
   const shortSecret = await callApi('save', {
     id: 'shorty', label: '短值', level: 'controlled', secret: 'short',
     hosts: ['127.0.0.1'], methods: ['GET'],
@@ -335,6 +357,33 @@ try {
       && JSON.stringify(valueDecision.value).includes(SECRET) === false
       && JSON.stringify(valueDecision.value).includes('[[vault:test-token]]'),
     JSON.stringify(valueDecision),
+  )
+
+  // ── 回归：**错误结果也必须脱敏**（2026-10-24 审计发现的高危漏洞）─────────
+  // 原来两个分支都带 `!result.isError`，于是任何抛异常的工具会把参数原样
+  // 回灌进会话。实证：`read` 一个名字里含 token 的不存在路径，
+  // 返回 `Error: cannot read "...ghp_xxx.txt": not found`，token 原样保留。
+  const errorWithSecret = await handlers['tools/post-execute'](
+    { name: 'read', callId: 'call-err' },
+    {
+      isError: true,
+      value: { error: `cannot read "C:/x/${SECRET}.txt": not found` },
+      content: [{ type: 'text', text: `Error: cannot read "C:/x/${SECRET}.txt": not found` }],
+    },
+    async () => ({ kind: 'accept' }),
+  )
+  const errText = (errorWithSecret.content ?? []).map((block) => block.text ?? '').join(' ')
+  check(
+    '错误结果同样脱敏（审计修复）',
+    errText.includes(SECRET) === false,
+    errText.slice(0, 160),
+  )
+
+  // 错误结果里的 value 也要脱敏（PTC 程序拿的是 value）。
+  check(
+    '错误结果的 value 同样脱敏',
+    JSON.stringify(errorWithSecret.value ?? {}).includes(SECRET) === false,
+    JSON.stringify(errorWithSecret.value ?? {}).slice(0, 160),
   )
 
   const grepHit = guards[0]({

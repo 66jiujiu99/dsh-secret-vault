@@ -1470,14 +1470,27 @@ export function apply(ctx, rawConfig) {
     let nextDecision = decision
     // A value is what a PTC program receives, and presentation meta is derived from it:
     // replacing the canonical value is the only way to keep both out of plaintext.
+    //
+    // ⚠ 2026-10-24 安全审计修复：**错误结果同样要脱敏**。
+    //
+    // 原来两个分支都带 `!result.isError`，于是任何抛异常的工具
+    // （`read` 一个不存在的路径、`write` 权限错、`grep` 参数错……）
+    // 会把参数原样回灌进会话日志。实证：`read .../ghp_EEEE....txt` 返回
+    // `Error: cannot read "...ghp_EEEE....txt": not found`，token 原样保留。
+    //
+    // 这条绕过同时绕开了「已知值精确匹配」与「正则形态」两层保护——
+    // 它是逻辑跳过，不是匹配失败。而错误是模型可控的高频路径，
+    // 攻击面比"模型刻意编码"实在得多。
     if (decision.kind === 'accept' && Object.hasOwn(decision, 'value')) {
-      if (!result.isError && decision.value !== undefined) {
+      if (decision.value !== undefined) {
         const redactedValue = redactJsonDeep(decision.value)
         if (JSON.stringify(redactedValue) !== JSON.stringify(decision.value)) {
           nextDecision = { ...nextDecision, value: redactedValue }
         }
       }
-    } else if (decision.kind === 'accept' && !result.isError) {
+    } else if (decision.kind === 'accept') {
+      // 成败都要走这一支。错误结果同样可能带出凭证：
+      // 工具把参数拼进错误消息是最常见的形态。
       const redactedValue = redactJsonDeep(result.value)
       if (JSON.stringify(redactedValue) !== JSON.stringify(result.value)) {
         const contexts = Array.isArray(decision.additionalContexts)
@@ -1491,6 +1504,7 @@ export function apply(ctx, rawConfig) {
       }
       const base = decision.content ?? result.content
       const content = redactBlocks(base)
+      // 错误结果也可能落产物文件（工具把错误写进文件），同样要清。
       await scrubArtifactFiles(content)
       if (content !== base) nextDecision = { ...nextDecision, content }
     } else if (decision.kind === 'block') {
@@ -1623,7 +1637,17 @@ export function apply(ctx, rawConfig) {
   function vaultState() {
     return {
       vault: { unlocked: loaded, itemCount: Object.keys(data?.items ?? {}).length, path: storePath, storeKind },
-      items: Object.values(data?.items ?? {}).map(itemMeta),
+      // ⚠ 2026-10-24 审计修复：这里原来直接 `itemMeta`，而 `itemMeta` 会把
+      // `meta` 的**值**带出来（如 cloudflare 的 account_id）。
+      // 系统提示 index.js:1623 与 README 都承诺「values stay hidden」，
+      // 而 `vault_list` 在 1207 行有 `delete summary.meta` 才是正确形态。
+      // 管理 API 也必须是同一口径，否则"字段值不显示"的承诺被自己破坏。
+      items: Object.values(data?.items ?? {}).map((item) => {
+        const summary = itemMeta(item)
+        delete summary.meta
+        summary.fields = Object.keys(item.meta || {})
+        return summary
+      }),
       audit: audit.slice(0, 50),
       policy: {
         redactPatterns: config.redactPatterns,
