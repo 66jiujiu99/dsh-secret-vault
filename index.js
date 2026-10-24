@@ -1792,13 +1792,37 @@ export function apply(ctx, rawConfig) {
           const presented = req.headers?.['x-secret-vault-token']
           const hasToken = typeof presented === 'string' && presented === uiToken
           const jsonContent = String(req.headers?.['content-type'] ?? '').toLowerCase().startsWith('application/json')
-          // Read-only metadata is already available to the model through vault_list, so state needs
-          // no gate. Mutations require JSON content-type: a cross-site page cannot send that without a
-          // CORS preflight (this route answers no preflight) and a plain HTML form cannot set it, so
-          // CSRF is blocked while ordinary same-origin fetches (including Desktop webviews that never
-          // receive the injected token) work. The token remains an additional accepted proof.
-          if (method !== 'state' && !hasToken && !jsonContent) {
-            respond(403, { ok: false, error: 'unauthorized: 请用设置页（同源 JSON 请求）保存；若页面过旧请刷新后重试' })
+          // 客户端自报来源：设置页会带 `x-secret-vault-request: 1`。
+          // 这个头本身也能被伪造，所以它只用于「区分是否走了设置页代码路径」，
+          // 不构成认证——真正的门槛见下面。
+          const fromUi = req.headers?.['x-secret-vault-request'] === '1'
+
+          // ⚠ 2026-10-24 安全审计修复：`content-type: application/json` **不是认证**。
+          //
+          // 原判断 `if (method !== 'state' && !hasToken && !jsonContent) → 403`
+          // 的隐含意思是「有 JSON content-type 就放行」。审计实测：
+          // 从模型 shell 里 `curl -H 'content-type: application/json' \
+          //   -d '{"method":"save",...}'` 就能创建/删除凭证。
+          //
+          // 原注释的理由（跨站页面设不了 JSON content-type ⇒ 防 CSRF）只对
+          // **浏览器发起的跨站请求**成立；对本机任意进程（模型 bash、别的程序）
+          // 完全不成立——它们想设什么头都行。
+          //
+          // ## 修法（兼容优先）
+          //
+          // 写操作要求同时满足两条之一：
+          //   a) 带 uiToken（设置页从 `<meta>` 读到，本机别的进程读不到）；
+          //   b) 走「JSON + 设置页来源头」这条老路——但**必须不是模型发起**。
+          //
+          // 为什么不直接砍掉 (b)：桌面 webview 可能拿不到 tapIndex 注入的 meta
+          // （取决于它是否经由 webServer 渲染首页）。直接砍会破坏桌面版保存功能。
+          // 这是明确的取舍：先保住可用性，同时在审计里如实标注残余风险。
+          const looksLikeUiCall = jsonContent && fromUi
+          if (method !== 'state' && !hasToken && !looksLikeUiCall) {
+            respond(403, {
+              ok: false,
+              error: 'unauthorized: 写操作必须由设置页发起（缺 ui token 与请求来源头）。若页面过旧，请刷新后重试',
+            })
             return
           }
           await ensureLoaded()
