@@ -178,6 +178,125 @@ function replaceStrings(value, replace) {
   return value
 }
 
+/**
+ * File names whose contents are the credential material itself, compared against
+ * a whole path segment. Substring matching is deliberately avoided: a script
+ * containing the regex source `\.credentials` does not open any file, and a
+ * prose sentence that mentions `.credentials.yaml` does not either.
+ */
+const PROTECTED_BASENAMES = new Set([
+  'vault.dpapi',
+  'vault.key',
+  'vault.json',
+  '.credentials',
+  '.credentials.yaml',
+  '.credentials.yml',
+  'credentials.yaml',
+  'credentials.yml',
+])
+
+/** Characters that end one shell / path token: whitespace, quoting and shell operators. */
+const TOKEN_SPLITTER = /[\s"'`;,|&()<>[\]{}]+/
+
+/** Separator-normalized, case-folded form used only for comparison. */
+function canonicalPath(text) {
+  return text.replace(/\\/g, '/').toLowerCase()
+}
+
+/**
+ * Split a string into the units a shell or a path argument treats as one value.
+ *
+ * The guard must react to what a tool can actually open, not to what a string
+ * mentions. `spawn_teammate({ prompt: '…credential id… C:/home/.dsh/…' })` is a
+ * prompt payload; `read({ path: '/home/.dsh/.credentials.yaml' })` is a read.
+ * Tokenizing first is what separates the two, because only the second yields a
+ * token that names the file.
+ */
+function fileNamingTokens(text) {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const out = []
+  for (const raw of text.split(TOKEN_SPLITTER)) {
+    const token = raw.trim()
+    if (token.length === 0 || token.length > 1024) continue
+    out.push(token)
+  }
+  return out
+}
+
+/** True when a token names the harness home directory itself or anything below it. */
+function isHarnessHomePath(path, home) {
+  if (home !== '' && (path === home || path.startsWith(`${home}/`))) return true
+  return path === '.dsh' || /(^|\/)\.dsh$/.test(path) || path.includes('/.dsh/')
+}
+
+/**
+ * True when a token could be handed to a filesystem API as a path or file name.
+ *
+ * This is the filter that keeps the guard from reading prose. A regex source
+ * such as `\.credentials` begins with a single backslash — an escape, not a UNC
+ * separator — and a token carrying regex syntax is a pattern, not a file name.
+ * Globs are handled separately because `*credential*` is a real read vector.
+ */
+function isFileNamingToken(token) {
+  if (/^[a-zA-Z]:[\\/]/.test(token)) return true
+  if (token.startsWith('\\\\')) return true
+  if (token.startsWith('/')) return true
+  if (/^\.{1,2}[\\/]/.test(token)) return true
+  if (token.startsWith('~/') || token.startsWith('~\\')) return true
+  // A leading single backslash is a regex escape, not a separator.
+  if (token.startsWith('\\')) return false
+  // Pattern syntax means this is not a literal file name.
+  if (/[()[\]{}|^$+*?]/.test(token)) return false
+  return true
+}
+
+/**
+ * Decide whether any argument token addresses protected credential material.
+ *
+ * Returns a short reason, or null. Three shapes are denied:
+ *  1. one token names a protected file, the vault store, or a `secret-vault` segment;
+ *  2. a glob that can match credential material is paired with a path inside the
+ *     harness home — `grep({ path: '<home>/.dsh', include: '*credential*' })` is a
+ *     real read of whatever that glob matches, even though neither token alone is
+ *     a file name.
+ *
+ * Nothing here joins unrelated strings. A sentence that happens to contain both
+ * the word "credential" and a harness-home path is not a read, and refusing it
+ * broke unrelated tools (2026-10-28: every `spawn_teammate` prompt that carried a
+ * profile path was rejected as a credential read). The layer that matters is the
+ * read itself, which is still denied below.
+ */
+function protectedPathReason(tokens, storeDir, dshHome) {
+  const store = canonicalPath(storeDir).replace(/\/+$/, '')
+  const home = canonicalPath(dshHome).replace(/\/+$/, '')
+  let harnessHomeSeen = false
+  let credentialGlobSeen = false
+  for (const token of tokens) {
+    // A single leading backslash is a regex escape (`\.credentials`), not a
+    // separator. Normalizing it to `/` would manufacture a path that the token
+    // never named, so the shape is decided before canonicalization.
+    if (token.startsWith('\\') && !token.startsWith('\\\\')) continue
+    const canonical = canonicalPath(token)
+    if (canonical.length === 0) continue
+    // Globs are patterns, so classify them before the literal-name filter.
+    if ((canonical.includes('*') || canonical.includes('?')) && canonical.includes('credential')) {
+      credentialGlobSeen = true
+      if (isHarnessHomePath(canonical, home)) harnessHomeSeen = true
+      continue
+    }
+    if (!isFileNamingToken(token)) continue
+    const path = canonical.replace(/\/+$/, '')
+    if (path.length === 0) continue
+    const base = path.slice(path.lastIndexOf('/') + 1)
+    if (PROTECTED_BASENAMES.has(base)) return `protected file ${base}`
+    if (store !== '' && (path === store || path.startsWith(`${store}/`))) return 'vault store path'
+    if (/(^|\/)secret-vault(\/|$)/.test(path)) return 'vault store segment'
+    if (isHarnessHomePath(path, home)) harnessHomeSeen = true
+  }
+  if (harnessHomeSeen && credentialGlobSeen) return 'credential glob under the harness home'
+  return null
+}
+
 /** Collect every string leaf, optionally skipping object keys that are prose/patch content. */
 function collectStringLeaves(value, skipKeys = null, out = [], depth = 0) {
   if (depth > 12) return out
@@ -1556,8 +1675,9 @@ export function apply(ctx, rawConfig) {
     try {
       const name = String(exec.name ?? '')
       const args = exec.arguments
-      // Path policy inspects every string the tool might treat as a path or command,
-      // except prose/patch payloads (those are covered by the secret scan below).
+      // Path policy inspects the strings a tool could open, except prose/patch
+      // payloads (those are covered by the secret scan below). Tokenizing inside
+      // `protectedPathReason` is what keeps mentions out and reads in.
       const skipKeys = new Set()
       if (name === 'write') skipKeys.add('content')
       if (name === 'edit') {
@@ -1566,20 +1686,13 @@ export function apply(ctx, rawConfig) {
       }
       const allStrings = collectStringLeaves(args)
       const pathStrings = skipKeys.size === 0 ? allStrings : collectStringLeaves(args, skipKeys)
-      const lowerPaths = pathStrings.map((entry) => entry.toLowerCase())
-      const lowerJoined = lowerPaths.join('\n')
+      const pathTokens = pathStrings.flatMap(fileNamingTokens)
       if (config.denyPathReads) {
-        const storeLower = storeDir.toLowerCase()
-        const vaultHit = lowerPaths.some((entry) => (
-          entry.includes(storeLower)
-          || entry.includes('vault.dpapi')
-          || entry.includes('vault.key')
-          || entry.includes('.credentials')
-          || /(^|[\\/])secret-vault([\\/]|$)/.test(entry)
-        )) || (lowerJoined.includes('credential') && (lowerJoined.includes('.dsh') || lowerJoined.includes('dsh_home')))
-        if (vaultHit) return 'secret-vault: 读取凭证存储被禁止'
+        const reason = protectedPathReason(pathTokens, storeDir, dshHome)
+        if (reason !== null) return `secret-vault: 读取凭证存储被禁止（${reason}）`
       }
-      if (config.denySpillReads && lowerPaths.some((entry) => entry.includes('dsh-spill-') || entry.includes('dsh-subprocess-'))) {
+      const spillHit = pathTokens.some((token) => token.includes('dsh-spill-') || token.includes('dsh-subprocess-'))
+      if (config.denySpillReads && spillHit) {
         return 'secret-vault: 读取 spill / 子进程日志文件被禁止'
       }
       if (substitutedExecs.has(exec)) {

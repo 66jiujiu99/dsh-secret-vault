@@ -70,7 +70,11 @@ spill / dsh-subprocess-* 文件 --> 解析通知路径、回写脱敏（仅临�
 同步、全局注册，内部全程 try/catch（异常转拒绝）：
 
 - 递归扫描 `exec.arguments` 的所有字符串叶子，出现已知值即拒绝；
-- 路径类字符串出现 vault 目录、spill/子进程日志、`.credentials.yaml` 即拒绝；
+- 路径类字符串出现 vault 目录、spill/子进程日志、`.credentials.yaml` 即拒绝。判定分两步：
+  先按空白/引号/shell 操作符切成 token（只有单个 token 才可能是文件访问），再用形状过滤
+  （绝对路径、`~/`、`./` 通过；前导单反斜杠是正则转义、带 `[](){}|^$+*?` 的是模式，都不是文件名），
+  最后按**完整 basename / 完整路径前缀**比对，不做子串匹配。凭证 glob 则要求同时出现 harness home
+  路径，避免把散文当读取（2026-10-28 修复：任务书里同时写「credential id」与 profile 路径曾被误拒）；
 - `vault_http` 的 host 不在凭证 hosts 内即拒绝；
 - 用 `WeakSet<exec>` 标记自己替换过的调用，避免误杀 L1 正常使用。
 
@@ -101,7 +105,8 @@ spill / dsh-subprocess-* 文件 --> 解析通知路径、回写脱敏（仅临�
 8. **托管 gh 引入外部二进制**：下载的是官方 release 并做 SHA-256 校验，但仍是供应链依赖；`GH_TOKEN` 会进子进程环境（L1）。不需要 gh 时不要调用 `vault_gh`。
 9. **Host 代码执行面**：`plugin_manager`、`cordis_run`、允许读本地路径的 MCP 工具都能绕过进程内 vault；此时必须使用进程外方案。
 10. **历史会话不追溯**：已持久化的明文不会被本插件回改。
+11. **guard 只认「像文件的 token」**：为消除误判（把散文当读取），判定从整串子串匹配改成了 tree token + 形状判定。代价是写法越隐蔽越可能绕过（变量拼接、base64 路径、`$(...)` 展开）——与原先「同 UID 不可防」的定位一致，不是新增风险面。
 
 ## 6. 验证
 
-`node test/harness.mjs` 覆盖 44 项断言：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard（含 `grep.include`/`terminal_send`）、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝。
+`node test/harness.mjs` 覆盖 60 项断言：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard（含 `grep.include`/`terminal_send`/散文放行/真实读取仍拒绝）、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝。

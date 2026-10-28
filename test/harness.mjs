@@ -397,6 +397,71 @@ try {
   })
   check('guard denies terminal_send credential read', typeof terminalHit === 'string', String(terminalHit))
 
+  // ── 回归：**提到凭证不等于读凭证**（2026-10-28 误判修复）─────────────────
+  // 旧判据把参数里所有字符串拼成一块，只要同时出现 "credential" 与 ".dsh"
+  // 就拒绝；也用 `includes('.credentials')` 匹配任意子串。后果是任何**描述**
+  // 凭证或带 profile 路径的正常调用——例如给子 agent 的任务书里写了
+  // "credential id is X" 和 "C:/home/.dsh/profiles/..."——都被当成读凭证。
+  const proseGuard = [
+    {
+      label: 'prompt mentioning a credential id and a profile path',
+      name: 'spawn_teammate',
+      arguments: {
+        name: 'scout',
+        prompt: 'GitHub credential id is github-dsh. Read files under C:\\Users\\me\\.dsh\\profiles\\desktop\\node_modules.',
+      },
+    },
+    {
+      label: 'script containing the regex source \\.credentials',
+      // The literal command carries one backslash: re.compile(r'\.credentials').
+      // A leading single backslash is a regex escape, not a path separator.
+      name: 'pwsh',
+      arguments: { command: "python -c \"import re; re.compile(r'\\.credentials')\"" },
+    },
+    {
+      label: 'prose mentioning the credential file name',
+      name: 'write',
+      arguments: { file_path: 'C:\\work\\notes.md', content: 'The store lives at .credentials.yaml in the harness home.' },
+    },
+  ]
+  for (const probe of proseGuard) {
+    const decision = guards[0]({ name: probe.name, callId: `guard-prose-${probe.name}`, arguments: probe.arguments })
+    check(`guard allows ${probe.label}`, typeof decision === 'undefined', String(decision))
+  }
+
+  // 放宽后必须仍然拦住真正的读取。
+  const stillDenied = [
+    {
+      label: 'read of the credential file',
+      name: 'read',
+      arguments: { file_path: 'C:\\Users\\me\\.dsh\\.credentials.yaml' },
+    },
+    {
+      label: 'relative read of the credential file',
+      name: 'read',
+      arguments: { file_path: '.dsh/.credentials.yaml' },
+    },
+    {
+      label: 'bash cat of the credential file',
+      name: 'bash',
+      arguments: { command: 'cat ~/.dsh/.credentials.yaml' },
+    },
+    {
+      label: 'read of the vault store',
+      name: 'read',
+      arguments: { file_path: join(home, 'secret-vault', 'vault.dpapi') },
+    },
+    {
+      label: 'read inside the vault store directory',
+      name: 'glob',
+      arguments: { pattern: '**/*', path: join(home, 'secret-vault') },
+    },
+  ]
+  for (const probe of stillDenied) {
+    const decision = guards[0]({ name: probe.name, callId: `guard-deny-${probe.name}`, arguments: probe.arguments })
+    check(`guard still denies ${probe.label}`, typeof decision === 'string', String(decision))
+  }
+
   const artifactDir = await mkdtemp(join(tmpdir(), 'dsh-subprocess-test-'))
   const artifactFile = join(artifactDir, 'out.log')
   await writeFile(artifactFile, `head ${extraSecret}\nghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n`, 'utf8')
