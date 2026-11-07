@@ -61,26 +61,31 @@
 
 回归测试在 `test/harness.mjs` 的 IMAP 段：本地假服务器覆盖 LOGIN/LIST/SEARCH/FETCH 与字面量解析、只读命令断言、坏密码/超时/超大响应、非 ASCII 拒绝、结果与错误不含哨兵 secret。
 
-## 2026-11-07 通道注册表与通用产物出口（0.6.0）
+## 2026-11-07 通道注册表与通用产物出口（0.6.x）
 
 `vault_http` / `vault_imap` / `vault_gh` 的实现移入 `transports/`，由注册表装配；工具名、schema、返回格式与错误文案保持不变。新增 `vault_save`：transport 产出字节，`artifacts.js` 决定能否落盘。
 
 已实现的硬约束：
 
 - 目录白名单 `artifactAllowDirs` 默认空 = 一律拒绝；请求目录与默认目录都 realpath，必须落在 realpath 后的白名单根内（拒绝 `..`、符号链接/junction 逃逸）；
+- 与保险库存储目录、DSH_HOME、本地凭据文件、spill 根目录重叠（相等、包含或被包含）的配置项会被拒绝，不会作为可读目录生效；`state.policy.artifact.rejected` 给出路径和原因；
+- 校验后的 artifact 目录**允许** `read`/`glob`/`grep`/`bash` 读取，因为里面是通道产物而不是凭据；guard 仍拒绝 vault/store、凭据文件、spill 目录；
 - 目标已存在默认拒绝；只有 `overwrite:true` 才覆盖普通文件；目标是符号链接/目录一律拒绝；
 - 同目录临时文件 + 原子 rename，失败删除临时文件；
 - `artifactMaxBytes` 默认 8 MiB，`maxBytes` 只能调低；超限报错不截断；
-- 默认拒绝可执行/脚本扩展名，`artifactAllowedExtensions` 是显式 opt-in；
-- 返回值只有 `{path, bytes, sha256}`，不含内容；读取 artifact 目录被 guard 拒绝（`vault_save` 例外）；
-- 落盘前扫描 UTF-8 文本中的已存凭证明文；审计只记 `{at,itemId,action,sessionId,ok}`，不含路径/数据。
+- 默认拒绝可执行/脚本扩展名与已知可执行内容类型，`artifactAllowedExtensions` 是显式 opt-in；
+- 返回值只有 `{path, bytes, sha256}`，不含内容；落盘前扫描 UTF-8 文本中的已存凭证明文；审计只记 `{at,itemId,action,sessionId,ok}`，不含路径/数据。
 
 新增残余风险：
 
 - 白名单 realpath 检查与写入之间存在 TOCTOU 窗口；同 UID 进程可在窗口内替换目录或文件。插件保护的是「模型经正常工具路径读回」，不是同 UID 恶意进程；
 - 明文扫描只覆盖 UTF-8 可读文本；二进制/编码/加密后的凭证明文不会命中；
 - 自动落盘（`artifactAutoSave`，默认关闭）会把完整响应写入 `artifactAutoDir`；开启前应确认该目录的访问控制；
+- artifact 目录现在按设计可读：如果用户把包含敏感文件的普通目录配进 `artifactAllowDirs`，guard 会允许读取该目录内的非凭据文件；配置校验只拦截插件已知的敏感根（存储/DSH_HOME/凭据/spill），不判断用户自己的其它敏感文件。产物目录应专用；
+- 配置校验使用 realpath 快照；校验后把目录替换成符号链接到敏感位置仍可能造成 TOCTOU（同 UID 威胁模型，见上）；
 - transport 的 artifact 取数仍然复用各自协议的安全边界（HTTP host/method、IMAP TLS/只读）；以后新增 FTP/SMTP/数据库 transport 时必须自己声明并校验相应策略，注册表只负责分派，不能代替协议层校验。
+
+0.6.1 变更：artifact 产物目录改为可读（此前 guard 把整个产物目录也当成禁读区，导致落盘后无法解压/入账）。为防止它变成读敏感数据的后门，`artifactAllowDirs` 会与凭证存储目录、DSH_HOME、spill 根目录做双向重叠校验，重叠项被拒绝并记录到 `state.policy.artifact.rejected`；guard 不再对产物目录做额外放行或拦截，仍按原有的 vault/凭据/spill 规则拒绝敏感路径。IMAP 附件名补充 RFC 2047（GB18030/GBK/Big5 等）与 RFC 2231 解码。
 
 ## 处理原则
 

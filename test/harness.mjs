@@ -6,9 +6,10 @@ import { createServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { Readable } from 'node:stream'
 import { createArtifactSink } from '../artifacts.js'
+import { attachmentFilename, decodeMimeWords } from '../imap.js'
 
 const home = await mkdtemp(join(tmpdir(), 'sv-test-'))
 process.env.DSH_HOME = home
@@ -86,7 +87,14 @@ apply(ctx, {
   imapCommandTimeoutMs: 3000,
   imapMaxBufferBytes: 262144,
   imapMaxLiteralBytes: 65536,
-  artifactAllowDirs: [artifactDir, autoDir],
+  artifactAllowDirs: [
+    artifactDir,
+    autoDir,
+    home,
+    join(home, 'secret-vault'),
+    tmpdir(),
+    join(tmpdir(), 'dsh-spill-probe'),
+  ],
   artifactDefaultDir: artifactDir,
   artifactAutoDir: autoDir,
   artifactMaxBytes: 1024 * 1024,
@@ -157,10 +165,17 @@ const IMAP_STRUCTURE = '(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 
 const IMAP_ATTACHMENT_BYTES = Buffer.from('%PDF-1.4\nFAKE-BILL-SENTINEL-0123456789\n', 'utf8')
 const IMAP_ATTACHMENT_BASE64 = IMAP_ATTACHMENT_BYTES.toString('base64').replace(/(.{76})/g, '$1\r\n')
 const IMAP_ATTACHMENT_OCTETS = Buffer.byteLength(IMAP_ATTACHMENT_BASE64, 'utf8')
-// The vault_imap metadata assertion keeps the historical 45678-octet fixture; the
-// attachment-download path needs a BODYSTRUCTURE whose octet count matches the bytes
-// the fake server actually returns (the completeness check compares the two).
-const IMAP_ATTACHMENT_STRUCTURE = IMAP_STRUCTURE.replace('45678', String(IMAP_ATTACHMENT_OCTETS))
+// 中文.zip in GB18030/GBK; RFC 2047 encoded intact, as QQ Mail does for Chinese names.
+const IMAP_GB_FILENAME_BYTES = Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0x2e, 0x7a, 0x69, 0x70])
+const IMAP_GB_FILENAME_WORD = `=?GB18030?B?${IMAP_GB_FILENAME_BYTES.toString('base64')}?=`
+const IMAP_ZIP_BYTES = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.from('FAKE-ZIP-SENTINEL-0123456789', 'utf8')])
+const IMAP_ZIP_BASE64 = IMAP_ZIP_BYTES.toString('base64').replace(/(.{76})/g, '$1\r\n')
+const IMAP_ZIP_OCTETS = Buffer.byteLength(IMAP_ZIP_BASE64, 'utf8')
+// The vault_imap metadata assertion keeps the historical 45678-octet fixture. The
+// attachment-download path needs a BODYSTRUCTURE whose octet counts match the bytes the
+// fake server actually returns (the completeness check compares the two); it also has a
+// second attachment with an RFC 2047 GB18030 filename.
+const IMAP_ATTACHMENT_STRUCTURE = `(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 5 NIL NIL NIL NIL)("APPLICATION" "PDF" ("NAME" "bill-2026-10.pdf") NIL NIL "BASE64" ${IMAP_ATTACHMENT_OCTETS} NIL ("ATTACHMENT" ("FILENAME" "bill-2026-10.pdf")) NIL NIL)("APPLICATION" "ZIP" ("NAME" "${IMAP_GB_FILENAME_WORD}") NIL NIL "BASE64" ${IMAP_ZIP_OCTETS} NIL ("ATTACHMENT" ("FILENAME" "${IMAP_GB_FILENAME_WORD}")) NIL NIL) "MIXED" ("BOUNDARY" "b1") NIL NIL NIL)`
 
 function fetchLiteral(seq, uid, size, structure, section, literal) {
   const body = Buffer.from(literal, 'utf8')
@@ -238,6 +253,11 @@ function startFakeImap(kind) {
       if (upper.startsWith('UID FETCH')) {
         if (upper.includes('BODYSTRUCTURE') && !upper.includes('BODY.PEEK[')) {
           send(`* 1 FETCH (UID 101 RFC822.SIZE 1234 BODYSTRUCTURE ${IMAP_ATTACHMENT_STRUCTURE})\r\n`)
+          send(`${tag} OK FETCH completed\r\n`)
+          return
+        }
+        if (upper.includes('BODY.PEEK[3]')) {
+          send(fetchLiteral(1, 101, 1234, null, 'BODY[3]', IMAP_ZIP_BASE64))
           send(`${tag} OK FETCH completed\r\n`)
           return
         }
@@ -953,6 +973,54 @@ try {
   const savedImapBytes = await readFile(savedImapArtifact.path)
   check('vault_save file is the decoded attachment, not base64', savedImapBytes.equals(IMAP_ATTACHMENT_BYTES))
 
+  const gbNameWord = `=?GB18030?B?${IMAP_GB_FILENAME_BYTES.toString('base64')}?=`
+  check('RFC2047 GB18030 attachment name decoded', decodeMimeWords(gbNameWord) === '中文.zip', decodeMimeWords(gbNameWord))
+  check(
+    'RFC2047 adjacent encoded words concatenated',
+    decodeMimeWords('=?GB18030?B?1tDOxA==?= =?GB18030?B?LnppcA==?=') === '中文.zip',
+    decodeMimeWords('=?GB18030?B?1tDOxA==?= =?GB18030?B?LnppcA==?='),
+  )
+  check(
+    'RFC2231 GB18030 attachment name decoded',
+    attachmentFilename({ FILENAME: "GB18030''%D6%D0%CE%C4.zip" }) === '中文.zip',
+    attachmentFilename({ FILENAME: "GB18030''%D6%D0%CE%C4.zip" }),
+  )
+  check(
+    'RFC2231 continuation filename decoded',
+    attachmentFilename({ 'FILENAME*0': "UTF-8''%E8%B4%A6", 'FILENAME*1': '%E5%8D%95.zip' }) === '账单.zip',
+    attachmentFilename({ 'FILENAME*0': "UTF-8''%E8%B4%A6", 'FILENAME*1': '%E5%8D%95.zip' }),
+  )
+  check(
+    'RFC2231 starred continuation filename decoded',
+    attachmentFilename({ 'FILENAME*0*': "UTF-8''%E8%B4%A6", 'FILENAME*1*': '%E5%8D%95.zip' }) === '账单.zip',
+    attachmentFilename({ 'FILENAME*0*': "UTF-8''%E8%B4%A6", 'FILENAME*1*': '%E5%8D%95.zip' }),
+  )
+  check(
+    'RFC2231 disposition filename overrides body name',
+    attachmentFilename({ NAME: 'fallback.txt' }, { FILENAME: "UTF-8''%E8%B4%A6%E5%8D%95.zip" }) === '账单.zip',
+    attachmentFilename({ NAME: 'fallback.txt' }, { FILENAME: "UTF-8''%E8%B4%A6%E5%8D%95.zip" }),
+  )
+
+  const savedZipArtifact = await saveCall({
+    id: 'imap-sealed',
+    source: { transport: 'imap', mailbox: 'INBOX', uid: 101, part: 'attachment:1' },
+    dir: artifactDir,
+  })
+  check(
+    'vault_save preserves the decoded ZIP filename and extension',
+    savedZipArtifact.path.endsWith('中文.zip') && savedZipArtifact.bytes === IMAP_ZIP_BYTES.length,
+    JSON.stringify(savedZipArtifact),
+  )
+  const savedZipBytes = await readFile(savedZipArtifact.path)
+  check('vault_save ZIP bytes are the decoded attachment', savedZipBytes.equals(IMAP_ZIP_BYTES))
+  check(
+    'attachment metadata size is encoded octets; saved bytes is decoded',
+    fetchHeaders.attachments[0].size === 45678
+      && fetchHeaders.attachments[0].size !== savedImapArtifact.bytes
+      && savedImapArtifact.bytes === IMAP_ATTACHMENT_BYTES.length,
+    JSON.stringify({ metadata: fetchHeaders.attachments[0].size, saved: savedImapArtifact.bytes }),
+  )
+
   const savedTextArtifact = await saveCall({
     id: 'imap-sealed', source: { transport: 'imap', mailbox: 'INBOX', uid: 101, part: 'text' },
     dir: artifactDir, filename: 'bill.txt',
@@ -1060,15 +1128,75 @@ try {
     name: 'read', callId: 'guard-artifact', arguments: { file_path: savedImapArtifact.path },
   })
   check(
-    'guard denies reading a saved artifact',
-    typeof artifactReadGuard === 'string' && artifactReadGuard.includes('落盘产物目录'),
+    'guard allows reading a saved artifact',
+    typeof artifactReadGuard === 'undefined',
     String(artifactReadGuard),
+  )
+  const artifactBashGuard = guards[0]({
+    name: 'bash', callId: 'guard-artifact-bash',
+    arguments: { command: `python -c "import zipfile; zipfile.ZipFile(r'${savedZipArtifact.path}')"` },
+  })
+  check(
+    'guard allows a command that references a saved artifact',
+    typeof artifactBashGuard === 'undefined',
+    String(artifactBashGuard),
+  )
+  const parenArtifact = await saveCall({
+    id: 'imap-sealed',
+    source: { transport: 'imap', mailbox: 'INBOX', uid: 101, part: 'attachment:1' },
+    dir: artifactDir,
+    filename: '账单(2026-10).zip',
+  })
+  const parenGuard = guards[0]({
+    name: 'bash', callId: 'guard-artifact-paren',
+    arguments: { command: `python -c "import zipfile; zipfile.ZipFile(r'${parenArtifact.path}')"` },
+  })
+  check(
+    'guard allows the real-world python command with parentheses in the path',
+    typeof parenGuard === 'undefined' && parenArtifact.path.endsWith('账单(2026-10).zip'),
+    String(parenGuard),
+  )
+  const dotdotCredential = join(artifactDir, relative(artifactDir, join(home, '.credentials.yaml')))
+  const dotdotGuard = guards[0]({
+    name: 'read', callId: 'guard-dotdot', arguments: { file_path: dotdotCredential },
+  })
+  check(
+    'guard still denies .. from an artifact directory to the credential file',
+    typeof dotdotGuard === 'string',
+    String(dotdotGuard),
   )
   const artifactSaveGuard = guards[0]({
     name: 'vault_save', callId: 'guard-artifact-save',
     arguments: { id: 'imap-sealed', source: attachmentSource, dir: artifactDir },
   })
   check('guard allows vault_save into the artifact directory', typeof artifactSaveGuard === 'undefined', String(artifactSaveGuard))
+
+  const homeArtifact = await saveError({
+    id: 'imap-sealed', source: attachmentSource, dir: home, filename: 'home.pdf',
+  })
+  check(
+    'vault_save rejects DSH_HOME as an artifact directory',
+    homeArtifact !== null && (homeArtifact.includes('敏感目录') || homeArtifact.includes('重叠')),
+    String(homeArtifact).slice(0, 240),
+  )
+  const storeArtifact = await saveError({
+    id: 'imap-sealed', source: attachmentSource, dir: join(home, 'secret-vault'), filename: 'store.pdf',
+  })
+  check(
+    'vault_save rejects the vault store as an artifact directory',
+    storeArtifact !== null && (storeArtifact.includes('敏感目录') || storeArtifact.includes('重叠')),
+    String(storeArtifact).slice(0, 240),
+  )
+  const traversalToHome = join(artifactDir, relative(artifactDir, home))
+  const traversalToHomeError = await saveError({
+    id: 'imap-sealed', source: attachmentSource, dir: traversalToHome, filename: 'escape.pdf',
+  })
+  check(
+    'vault_save rejects .. from an artifact directory into DSH_HOME',
+    traversalToHomeError !== null
+      && (traversalToHomeError.includes('敏感目录') || traversalToHomeError.includes('重叠') || traversalToHomeError.includes('白名单')),
+    String(traversalToHomeError).slice(0, 240),
+  )
 
   const largeHttp = await tools.vault_http.execute(
     { id: 'sealed-token', method: 'GET', url: `http://127.0.0.1:${port}/large` },
@@ -1106,10 +1234,18 @@ try {
       && artifactAudit.includes('HTTP-SENTINEL') === false,
     artifactAudit.slice(0, 300),
   )
+  const artifactPolicy = artifactState.body.value.policy.artifact
   check(
-    'artifact state does not expose the output directory',
-    JSON.stringify(artifactState.body.value).includes(artifactDir) === false,
-    'artifact path leaked into state',
+    'artifact state exposes validated dirs and rejects sensitive overlaps',
+    artifactPolicy.allowDirs.length === 2
+      && artifactPolicy.allowDirs.includes(artifactDir)
+      && artifactPolicy.allowDirs.includes(autoDir)
+      && artifactPolicy.rejected.length === 4
+      && artifactPolicy.rejected.some((item) => item.path === home && item.reason !== '')
+      && artifactPolicy.rejected.some((item) => item.path === join(home, 'secret-vault') && item.reason.includes('保险库'))
+      && artifactPolicy.rejected.some((item) => item.path === tmpdir() && item.reason.includes('temp'))
+      && artifactPolicy.rejected.some((item) => item.path.includes('dsh-spill-probe') && item.reason.includes('spill')),
+    JSON.stringify(artifactPolicy),
   )
 } finally {
   imapNormal.server.close()

@@ -30,7 +30,7 @@
 - **三级隐私等级**：`controlled` / `sealed` / `ephemeral`，按「值能去哪」而不是「加密强度」划分。
 - **宿主内 IMAP 只读通道**：`vault_imap` 支持 `list` / `search` / `fetch`，覆盖「用 sealed 凭证读邮箱」这类 HTTP 代理做不到的场景；只读命令白名单（`EXAMINE` + `BODY.PEEK`，没有 STORE/EXPUNGE/DELETE），TLS 证书校验开启，结果同样脱敏并有硬上限。
 - **通道注册表**：`http` / `imap` / `gh` 各自是 `transports/` 下的独立模块，声明 id、策略字段、动作、工具和（可选）产物源；`index.js` 只做安全核心与注册，不再按协议分支。新增一个通道 = 加一个文件 + 一行注册。
-- **通用产物出口**：`vault_save` 接受类型化的 `source`（由 transport 解释），把 IMAP 附件、HTTP 响应等二进制/大体量数据落到白名单目录；只返回 `{path, bytes, sha256}`，不返回内容，读回受 guard 限制。
+- **通用产物出口**：`vault_save` 接受类型化的 `source`（由 transport 解释），把 IMAP 附件、HTTP 响应等二进制/大体量数据落到白名单目录；只返回 `{path, bytes, sha256}`，不返回内容。经 realpath 校验的产物目录可以正常读回（用于解压/入账）；与保险库存储、DSH_HOME、本地凭据、spill 临时目录重叠的配置项会被拒绝。
 - **大响应自动落盘（可选，默认关闭）**：开启 `artifactAutoSave` 后，`vault_http` 超过 `maxResponseChars` 的响应会完整落盘并返回路径 + 脱敏后的前段，而不是只截断。
 - **域名 + 方法白名单**：`sealed`/`ephemeral` 只能访问声明的 host、使用声明的 HTTP 方法；不跟随重定向。
 - **结果脱敏**：已知值及其 JSON 转义 / base64 / hex / URL 编码 / Basic `base64(user:secret)` 变体都会被替换；常见 token 形态（`ghp_`、`sk-`、`AKIA`、私钥块、JWT…）即使不在库里也会被 pattern 脱敏。
@@ -210,6 +210,10 @@ vault_imap({
 - `search`：`total`、`uids[]`、`messages[]`（每封的 `uid` / `from` / `subject` / `date` / `size`），**不返回正文**；
 - `fetch`：`headers` 或受上限约束的 `text`，以及 `attachments[]`（**只有文件名/大小/类型，不返回二进制**）。
 
+> **附件 size 口径**：`attachments[].size` 是 IMAP `BODYSTRUCTURE` 的 octets，即**传输编码后的线上字节数**（base64 约为解码后的 4/3，quoted-printable 最多约 3 倍，7bit/8bit 相同）；`vault_save` 返回的 `bytes` 是**解码后实际落盘字节数**。两者不相等是正常的：线上 6690、落盘 4890 就是 base64 前后口径差，不是解析 bug。
+>
+> **附件名解码**：支持 RFC 2047（`=?GB18030?B?...?=`、`=?GBK?Q?...?=`、UTF-8、Big5 等）和 RFC 2231（`filename*=`、`filename*0*` 连续段）；GB18030/GBK/GB2312 的国内邮件能解出中文名并保留 `.zip` 等扩展名。确实没有名字时才兜底 `(未命名)`，再按 Content-Type 补扩展名。
+
 连接参数不新增策略字段：
 
 | 参数 | 取值顺序 |
@@ -281,7 +285,7 @@ vault_save({
 - **原子写**：先写同目录临时文件，再 rename；失败会删除临时文件，不留半截文件。
 - **大小上限**：`artifactMaxBytes`（默认 8 MiB）；`maxBytes` 只能调低，不能超过配置上限；超限直接报错，不截断。
 - **扩展名/内容类型**：默认拒绝 `.exe/.dll/.bat/.ps1/.js/.vbs/.scr/.msi/.lnk` 等可执行/脚本类扩展名，也拒绝已知可执行内容类型；需要时用 `artifactAllowedExtensions` 显式白名单。
-- **只写不读**：返回值只有 `path/bytes/sha256`，永不返回文件内容；`read`/`glob`/`grep`/`bash` 等访问该目录会被 guard 拒绝；`vault_save` 自身例外。
+- **落盘后可读**：返回值只有 `path/bytes/sha256`，永不返回文件内容；但 `artifactAllowDirs` 经 realpath 校验后，`read`/`glob`/`grep`/`bash` 等可以正常读回产物（账单压缩包、发票、CSV）。如果某个配置项与保险库存储目录、DSH_HOME、本地凭据文件或 spill 临时目录重叠，该配置项会被拒绝并在 `state.policy.artifact.rejected` 里说明原因，不会静默放行。
 - **明文扫描**：落盘前会扫描字节的 UTF-8 文本，发现已存凭证明文就拒绝写入。
 - **审计**：只记 `{at,itemId,action:"save:<transport>",sessionId,ok}`，不含路径或数据。
 
@@ -289,7 +293,7 @@ vault_save({
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `artifactAllowDirs` | `[]` | 允许落盘的目录；空 = 拒绝所有落盘 |
+| `artifactAllowDirs` | `[]` | 允许落盘的目录；空 = 拒绝所有落盘；与凭证存储、DSH_HOME、spill 根目录重叠的条目会被拒绝并显示在 `state.policy.artifact.rejected` |
 | `artifactDefaultDir` | 空 | 调用方省略 `dir` 时使用；必须命中白名单 |
 | `artifactMaxBytes` | `8388608`（8 MiB） | 单次落盘硬上限 |
 | `artifactAutoSave` | `false` | `vault_http` 大响应自动落盘开关 |
@@ -378,7 +382,7 @@ vault_gh({
 - `sealed`/`ephemeral` 不会把值交给任何子进程；
 - `vault_imap` 的 IMAP 会话在 Host 内完成，值不进入工具参数/结果/子进程；只发送只读命令，`EXAMINE` + `BODY.PEEK` 不置 `\Seen`，没有 STORE/EXPUNGE/DELETE 等写路径；
 - `vault_save` 只写 `artifactAllowDirs` 白名单内、realpath 校验过的目录；默认不覆盖、原子写、大小上限、可执行扩展名拒绝，落盘前扫描已存凭证明文；
-- 读取落盘产物目录会被 guard 拒绝（`vault_save` 自身例外），工具返回值只有路径/大小/哈希，没有文件内容；
+- 读取落盘产物目录**不再被 guard 拒绝**：`artifactAllowDirs` 经 realpath 校验后，产物文件可被 `read`/`bash` 等读回；与保险库存储、DSH_HOME、本地凭据文件、spill 临时目录重叠的配置项会被拒绝，并在 `state.policy.artifact.rejected` 里给出原因；
 - 读取 vault、spill、子进程日志、`.credentials.yaml` 会被 guard 拒绝；
 - 管理面不能把 `sealed` 静默降级为 `controlled`。
 
@@ -407,7 +411,9 @@ node test/harness.mjs
 
 覆盖：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝，以及 `vault_imap`（本地假 IMAP 服务器：LOGIN/LIST/SEARCH/FETCH 与字面量、只读命令断言、坏密码/超时/超大响应、非 ASCII 拒绝、结果与错误不含哨兵 secret）。
 
-0.6.0 新增覆盖：`vault_transports` 内省；`vault_save` 的 IMAP 附件/文本与 HTTP 响应落盘、目录白名单外、`..` 穿越、junction 逃逸、默认不覆盖、`overwrite:true`、大小上限、可执行扩展名、原子写失败清理、audit/state 不含路径与内容、返回值不含文件内容；`artifactAutoSave` 默认关闭，以及单独开启后的完整落盘。
+0.6.0 新增覆盖：`vault_transports` 内省；`vault_save` 的 IMAP 附件/文本与 HTTP 响应落盘、目录白名单外、`..` 穿越、junction 逃逸、默认不覆盖、`overwrite:true`、大小上限、可执行扩展名、原子写失败清理、audit/state 不含内容、返回值不含文件内容；`artifactAutoSave` 默认关闭，以及单独开启后的完整落盘。
+
+0.6.1 新增覆盖：产物落盘后可由 guard 放行读回；`artifactAllowDirs` 与凭证存储目录、DSH_HOME、系统 temp/spill 目录重叠时被拒绝并在 `state.policy.artifact.rejected` 中说明；`..` 从产物目录跳回 DSH_HOME 仍被拒；RFC 2047（GB18030/GBK，含相邻 encoded-word）与 RFC 2231（`filename*=`/连续段）附件名解码并保留扩展名；BODYSTRUCTURE 编码 size 与落盘解码 bytes 的口径区分。
 
 ```bash
 node test/harness.mjs          # 主回归

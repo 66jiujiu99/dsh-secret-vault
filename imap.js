@@ -76,13 +76,27 @@ function unquote(text) {
   return raw
 }
 
+const CHARSET_ALIASES = {
+  'gb2312': 'gbk',
+  'gb_2312-80': 'gbk',
+  'x-gbk': 'gbk',
+  'cp936': 'gbk',
+  'windows-936': 'gbk',
+  'big5-hkscs': 'big5',
+  'ks_c_5601-1987': 'euc-kr',
+  'us-ascii': 'utf-8',
+}
+
 /**
  * Decode RFC 2047 encoded words (`=?UTF-8?B?...?=`). QQ Mail encodes Chinese
  * subjects and attachment names this way; without decoding the model would see base64.
+ * Whitespace between adjacent encoded words is ignored per RFC 2047, so split
+ * `=?GB18030?...?=` words still form one contiguous name.
  */
 export function decodeMimeWords(value) {
   if (typeof value !== 'string' || value === '') return ''
-  return value.replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (whole, charset, encoding, data) => {
+  const joined = value.replace(/\?=\s+=\?/g, '?==?')
+  return joined.replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (whole, charset, encoding, data) => {
     try {
       const bytes = encoding.toLowerCase() === 'b' ? Buffer.from(data, 'base64') : decodeQuotedPrintable(data.replace(/_/g, ' '))
       return decodeBytes(bytes, charset)
@@ -106,14 +120,94 @@ function decodeQuotedPrintable(text) {
   return Buffer.from(bytes)
 }
 
-function decodeBytes(bytes, charset) {
-  const label = String(charset ?? '').split('*')[0].trim().toLowerCase()
-  const normalized = label === 'gb2312' || label === 'gb_2312-80' ? 'gbk' : label === 'us-ascii' ? 'utf-8' : label
-  try {
-    return new TextDecoder(normalized || 'utf-8', { fatal: false }).decode(bytes)
-  } catch {
-    return bytes.toString('utf8')
+function percentBytes(text) {
+  const bytes = []
+  const source = String(text ?? '')
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] === '%' && /^[0-9A-Fa-f]{2}$/.test(source.slice(i + 1, i + 3))) {
+      bytes.push(Number.parseInt(source.slice(i + 1, i + 3), 16))
+      i += 2
+    } else {
+      bytes.push(source.charCodeAt(i) & 0xff)
+    }
   }
+  return Buffer.from(bytes)
+}
+
+export function decodeBytes(bytes, charset) {
+  const label = String(charset ?? '').split('*')[0].trim().toLowerCase()
+  const normalized = CHARSET_ALIASES[label] ?? (label === '' ? 'utf-8' : label)
+  for (const candidate of [normalized, 'utf-8', 'gb18030', 'gbk', 'latin1']) {
+    try {
+      return new TextDecoder(candidate, { fatal: false }).decode(bytes)
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return bytes.toString('utf8')
+}
+
+/**
+ * Decode RFC 2231 parameter syntax: `charset'language'percent-bytes`.
+ * Used by `filename*=GB18030''%D6%D0%CE%C4.zip` and continuous `filename*0*`.
+ */
+export function decodeRfc2231(value) {
+  const raw = String(value ?? '')
+  const match = /^([^']*)'([^']*)'([\s\S]*)$/.exec(raw)
+  const charset = match === null ? 'utf-8' : match[1]
+  const encoded = match === null ? raw : match[3]
+  return decodeBytes(percentBytes(encoded), charset || 'utf-8')
+}
+
+/**
+ * Resolve an attachment name from BODYSTRUCTURE params, preferring the disposition
+ * `filename` over the body `name`, and supporting both RFC 2047 and RFC 2231.
+ */
+export function attachmentFilename(params, dispositionParams) {
+  const merged = Object.create(null)
+  for (const source of [params, dispositionParams]) {
+    if (source === null || typeof source !== 'object') continue
+    for (const [key, value] of Object.entries(source)) {
+      merged[String(key).toUpperCase()] = String(value ?? '')
+    }
+  }
+  const continuation = (key) => {
+    const parts = []
+    for (let index = 0; index < 20; index += 1) {
+      // RFC 2231 continuation keys may be `filename*0` or `filename*0*` (the trailing
+      // star means the segment is percent-encoded).
+      const value = merged[`${key}*${index}*`] ?? merged[`${key}*${index}`]
+      if (value === undefined) break
+      parts.push(value)
+    }
+    if (parts.length === 0) return null
+    const first = parts[0]
+    const match = /^([^']*)'([^']*)'([\s\S]*)$/.exec(first)
+    const charset = match === null ? 'utf-8' : match[1]
+    if (match !== null) parts[0] = match[3]
+    const bytes = []
+    for (const part of parts) {
+      const decoded = percentBytes(part)
+      for (const byte of decoded) bytes.push(byte)
+    }
+    return decodeBytes(Buffer.from(bytes), charset || 'utf-8')
+  }
+  const valueOf = (key) => {
+    const continued = continuation(key)
+    if (continued !== null) return continued
+    if (merged[`${key}*`] !== undefined) return decodeRfc2231(merged[`${key}*`])
+    const plain = merged[key]
+    if (plain === undefined) return ''
+    // Some servers put RFC 2231 syntax in the plain filename/name parameter instead of
+    // the `*` form; accept it rather than showing the raw percent bytes.
+    if (/^[^']*'[^']*'/.test(plain) && /%[0-9A-Fa-f]{2}/.test(plain)) return decodeRfc2231(plain)
+    return decodeMimeWords(plain)
+  }
+  for (const key of ['FILENAME', 'NAME']) {
+    const value = valueOf(key).trim()
+    if (value !== '') return value
+  }
+  return ''
 }
 
 /** Flatten a raw header block into a lower-cased map, unfolding continuation lines. */
@@ -458,7 +552,7 @@ export function collectAttachmentParts(structure, depth = 0) {
     const encoding = String(node[5] ?? '').toUpperCase()
     const size = Number(node[6]) || 0
     const disposition = findDisposition(node)
-    const filename = decodeMimeWords(String(disposition?.params?.FILENAME ?? params.FILENAME ?? params.NAME ?? '')).trim()
+    const filename = attachmentFilename(params, disposition?.params).trim()
     const isAttachment = disposition?.type === 'ATTACHMENT' || (filename !== '' && type !== 'TEXT')
     if (!isAttachment) return
     if (out.length >= 50) return

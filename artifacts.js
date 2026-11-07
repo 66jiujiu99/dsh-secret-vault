@@ -20,6 +20,7 @@
  * prove that the temp file is cleaned up. Production always uses node:fs/promises.
  */
 import { createHash, randomBytes } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { basename, extname, join, resolve, sep } from 'node:path'
 import * as defaultFs from 'node:fs/promises'
 
@@ -82,6 +83,20 @@ function isInside(root, candidate) {
   return candidate.startsWith(`${root}${sep}`) || candidate.startsWith(`${root}/`)
 }
 
+/** realpath when possible; a not-yet-created path falls back to a normalized absolute path. */
+function realOrResolved(value) {
+  const absolute = resolve(String(value ?? ''))
+  try {
+    return realpathSync(absolute)
+  } catch {
+    return absolute
+  }
+}
+
+function overlaps(a, b) {
+  return isInside(a, b) || isInside(b, a)
+}
+
 function extensionForContentType(contentType) {
   const type = String(contentType ?? '').split(';')[0].trim().toLowerCase()
   return CONTENT_TYPE_EXT[type] ?? ''
@@ -105,7 +120,7 @@ function sanitizeFilename(raw, { userSupplied }) {
   return name
 }
 
-export function createArtifactSink({ config, host, fsOps = defaultFs }) {
+export function createArtifactSink({ config, host, fsOps = defaultFs, sensitiveRoots = [] }) {
   const fs = {
     realpath: fsOps.realpath ?? defaultFs.realpath,
     lstat: fsOps.lstat ?? defaultFs.lstat,
@@ -114,20 +129,73 @@ export function createArtifactSink({ config, host, fsOps = defaultFs }) {
     rm: fsOps.rm ?? defaultFs.rm,
   }
   const configuredMax = () => host.toInt(config.artifactMaxBytes, DEFAULT_ARTIFACT_MAX_BYTES, 1, 1024 * 1024 * 1024)
+  const roots = sensitiveRoots
+    .filter((root) => root !== null && typeof root === 'object' && typeof root.path === 'string' && root.path.trim() !== '')
+    .map((root) => ({
+      real: realOrResolved(root.path),
+      reason: typeof root.reason === 'string' && root.reason !== '' ? root.reason : 'sensitive root',
+      ancestorsOnly: root.ancestorsOnly === true,
+    }))
 
-  async function realAllowedDirs() {
-    const raw = Array.isArray(config.artifactAllowDirs) ? config.artifactAllowDirs : []
-    const out = []
-    for (const entry of raw) {
-      if (typeof entry !== 'string' || entry.trim() === '') continue
-      try {
-        const real = await fs.realpath(resolve(entry))
-        if (!out.includes(real)) out.push(real)
-      } catch {
-        /* a missing allowlist entry cannot be used; it is not a fallback */
+  function rejectionReason(real) {
+    let ancestorReason = null
+    for (const root of roots) {
+      if (root.ancestorsOnly) {
+        // This root (system temp) only rejects itself and its ancestors. Its descendants
+        // are normal user/temp directories and may legitimately be artifact outputs.
+        if (real === root.real || isInside(real, root.real)) {
+          return { reason: root.reason, ancestorsOnly: true }
+        }
+        continue
+      }
+      if (real === root.real || isInside(root.real, real)) {
+        // The allowlist entry is the sensitive root or lives inside it: every path below
+        // it is sensitive, so descendants must stay blocked.
+        return { reason: root.reason, ancestorsOnly: false }
+      }
+      if (isInside(real, root.real)) {
+        // The entry contains a sensitive root (e.g. DSH_HOME contains the vault store).
+        // Reject the entry, but do not mark all of its unrelated children as sensitive.
+        if (ancestorReason === null) ancestorReason = root.reason
       }
     }
-    return out
+    // A directory that *is* a spill/subprocess root (or lives inside one) must never be
+    // turned into a readable artifact directory.
+    if (/(^|[\\/])(dsh-spill-|dsh-subprocess-)/i.test(real)) {
+      return { reason: 'spill / subprocess 临时目录', ancestorsOnly: false }
+    }
+    if (ancestorReason !== null) return { reason: ancestorReason, ancestorsOnly: true }
+    return null
+  }
+
+  /**
+   * Effective allowlist after rejecting overlaps with sensitive roots. This is also what
+   * the guard exposes to the model: only validated directories are readable; a rejected
+   * configuration entry is never silently treated as allowed.
+   */
+  function status() {
+    const raw = Array.isArray(config.artifactAllowDirs) ? config.artifactAllowDirs : []
+    const allowed = []
+    const rejected = []
+    for (const entry of raw) {
+      if (typeof entry !== 'string' || entry.trim() === '') continue
+      const real = realOrResolved(entry)
+      const rejection = rejectionReason(real)
+      if (rejection !== null) {
+        if (!rejected.some((item) => item.path === real)) {
+          rejected.push({ path: real, reason: rejection.reason, ancestorsOnly: rejection.ancestorsOnly })
+        }
+      } else if (!allowed.includes(real)) {
+        allowed.push(real)
+      }
+    }
+    return { allowed, rejected }
+  }
+
+  function rejectedHit(real, current) {
+    return current.rejected.find((item) => (item.ancestorsOnly
+      ? (real === item.path || item.path.startsWith(`${real}${sep}`) || item.path.startsWith(`${real}/`))
+      : overlaps(real, item.path)))
   }
 
   function chooseFilename({ hint, provided, contentType }) {
@@ -161,13 +229,18 @@ export function createArtifactSink({ config, host, fsOps = defaultFs }) {
   }
 
   async function resolveDestination({ dir, providedFilename, hintFilename, contentType, overwrite }) {
-    const roots = await realAllowedDirs()
-    if (roots.length === 0) throw new Error('未配置 artifactAllowDirs，拒绝落盘（默认空 = 一律拒绝）')
+    const current = status()
+    if (current.allowed.length === 0) {
+      const detail = current.rejected.length > 0
+        ? `；artifactAllowDirs 条目均因与敏感目录重叠被拒绝：${current.rejected.map((item) => `${item.path}（${item.reason}）`).join('；')}`
+        : ''
+      throw new Error(`未配置可用的 artifactAllowDirs，拒绝落盘${detail}`)
+    }
     const requested = (typeof dir === 'string' && dir.trim() !== '')
       ? dir.trim()
       : (typeof config.artifactDefaultDir === 'string' ? config.artifactDefaultDir.trim() : '')
     if (requested === '') {
-      if (roots.length === 1) return finishDestination(roots[0], { providedFilename, hintFilename, contentType, overwrite })
+      if (current.allowed.length === 1) return finishDestination(current.allowed[0], { providedFilename, hintFilename, contentType, overwrite })
       throw new Error('请指定 dir，或配置唯一的 artifactDefaultDir')
     }
     let real
@@ -176,7 +249,11 @@ export function createArtifactSink({ config, host, fsOps = defaultFs }) {
     } catch {
       throw new Error('落盘目录不存在或不可访问')
     }
-    if (!roots.some((root) => isInside(root, real))) {
+    const hit = rejectedHit(real, current)
+    if (hit !== undefined) {
+      throw new Error(`落盘目录与敏感目录重叠，已拒绝（${hit.reason}）：${hit.path}`)
+    }
+    if (!current.allowed.some((root) => isInside(root, real))) {
       throw new Error('落盘目录不在 artifactAllowDirs 白名单内')
     }
     return finishDestination(real, { providedFilename, hintFilename, contentType, overwrite })
@@ -250,7 +327,7 @@ export function createArtifactSink({ config, host, fsOps = defaultFs }) {
     }
   }
 
-  return { saveBuffer, resolveDestination, configuredMax }
+  return { saveBuffer, resolveDestination, configuredMax, status }
 }
 
 /** Generic `vault_save` tool. It knows nothing about HTTP or IMAP. */
@@ -258,7 +335,7 @@ export function createArtifactTool({ host, registry }) {
   const { config } = host
   return {
     name: 'vault_save',
-    description: 'Write bytes produced by a transport to a local file without returning the content. `source` is a typed descriptor interpreted by the transport (for example { transport: "imap", mailbox, uid, part: "attachment:0" } or { transport: "http", url, method }). The target must be inside artifactAllowDirs, must not exist unless overwrite:true, and must use a non-executable extension. Returns only {path, bytes, sha256}; reading that path is blocked by the guard.',
+    description: 'Write bytes produced by a transport to a local file without returning the content. `source` is a typed descriptor interpreted by the transport (for example { transport: "imap", mailbox, uid, part: "attachment:0" } or { transport: "http", url, method }). The target must be inside artifactAllowDirs, must not exist unless overwrite:true, and must use a non-executable extension. Returns only {path, bytes, sha256}; validated artifact directories are readable by other tools, while config entries overlapping sensitive roots are rejected.',
     parameters: {
       type: 'object',
       properties: {
@@ -388,7 +465,7 @@ export function createArtifactTool({ host, registry }) {
             sha256: saved.sha256,
             filename: saved.filename,
             ...(typeof produced.contentType === 'string' && produced.contentType !== '' ? { contentType: produced.contentType } : {}),
-            note: '文件内容不会返回给模型；直接用 read/write/glob 等访问该路径会被 guard 拒绝。',
+            note: '文件内容不会返回给模型；产物目录经 realpath 校验后可直接用 read/glob 等读回。',
           }
         } catch (error) {
           if (limited) host.releaseUse(item)

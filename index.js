@@ -309,33 +309,6 @@ function protectedPathReason(tokens, storeDir, dshHome) {
   return null
 }
 
-/**
- * Deny reading files that live under a configured artifact directory.
- *
- * `vault_save` itself is exempt in the guard: it is the only writer, it never returns
- * content, and its `dir` argument must be inside the allowlist. Every other tool that
- * names a path in one of these roots (read/glob/grep/bash/pwsh/terminal_send/...) is
- * refused, so a saved credential-bearing response cannot be read straight back.
- */
-function protectedArtifactReason(tokens, dirs) {
-  const roots = []
-  for (const entry of Array.isArray(dirs) ? dirs : []) {
-    if (typeof entry !== 'string' || entry.trim() === '') continue
-    const root = canonicalPath(resolve(entry)).replace(/\/+$/, '')
-    if (root !== '') roots.push(root)
-  }
-  if (roots.length === 0) return null
-  for (const token of tokens) {
-    if (!isFileNamingToken(token)) continue
-    const path = canonicalPath(token).replace(/\/+$/, '')
-    if (path === '') continue
-    for (const root of roots) {
-      if (path === root || path.startsWith(`${root}/`)) return 'artifact output directory'
-    }
-  }
-  return null
-}
-
 /** Collect every string leaf, optionally skipping object keys that are prose/patch content. */
 function collectStringLeaves(value, skipKeys = null, out = [], depth = 0) {
   if (depth > 12) return out
@@ -1142,7 +1115,23 @@ export function apply(ctx, rawConfig) {
     httpMethods: HTTP_METHODS,
     artifact: null,
   }
-  vaultHost.artifact = createArtifactSink({ config, host: vaultHost })
+  // Roots that must never be readable through an artifact allowlist. A config entry
+  // that overlaps one of these is rejected instead of silently becoming a read backdoor.
+  const sensitiveArtifactRoots = [
+    { path: storeDir, reason: '凭证保险库存储目录' },
+    { path: dshHome, reason: 'DSH_HOME（本地凭据与 profile 所在目录）' },
+    { path: tmpdir(), reason: '系统 temp spill 根目录', ancestorsOnly: true },
+  ]
+  for (const root of Array.isArray(config.spillRoots) ? config.spillRoots : []) {
+    if (typeof root === 'string' && root.trim() !== '') {
+      sensitiveArtifactRoots.push({ path: resolve(root), reason: 'spill 根目录' })
+    }
+  }
+  vaultHost.artifact = createArtifactSink({
+    config,
+    host: vaultHost,
+    sensitiveRoots: sensitiveArtifactRoots,
+  })
   const registry = createTransportRegistry(vaultHost, transportFactories)
   vaultHost.registry = registry
   const transportsTool = createTransportsTool(registry)
@@ -1274,17 +1263,12 @@ export function apply(ctx, rawConfig) {
       if (config.denyPathReads) {
         const reason = protectedPathReason(pathTokens, storeDir, dshHome)
         if (reason !== null) return `secret-vault: 读取凭证存储被禁止（${reason}）`
-        // vault_save is the only writer and never returns content; all other tools are
-        // refused when they name a file under an artifact directory.
-        if (name !== 'vault_save') {
-          const artifactDirs = [
-            ...(Array.isArray(config.artifactAllowDirs) ? config.artifactAllowDirs : []),
-            config.artifactDefaultDir,
-            config.artifactAutoDir,
-          ]
-          const artifactReason = protectedArtifactReason(pathTokens, artifactDirs)
-          if (artifactReason !== null) return `secret-vault: 读取落盘产物目录被禁止（${artifactReason}）`
-        }
+        // Artifact outputs are user data, not credential material. The old blanket
+        // "artifact directory is unreadable" rule is gone; reading inside a validated
+        // artifact directory now falls through to the normal rules. The artifact sink
+        // refuses config entries that overlap the store/DSH_HOME/spill roots, so a
+        // rejected entry never becomes a readable artifact directory in the first place.
+        // The vault store, credential files and spill paths remain denied below/above.
       }
       const spillHit = pathTokens.some((token) => token.includes('dsh-spill-') || token.includes('dsh-subprocess-'))
       if (config.denySpillReads && spillHit) {
@@ -1329,7 +1313,7 @@ export function apply(ctx, rawConfig) {
           '- `vault_imap({ id, action, mailbox?, ... })` reads mail through a native read-only IMAP session inside the Host process: `list` mailboxes, `search` (since/before/from/subject/body/text/unseen) for UIDs plus From/Subject/Date/size, `fetch` one UID\'s headers or a size-capped text part. It works for sealed/ephemeral credentials because the value never leaves the Host; TLS is mandatory, only ASCII mailbox names/search strings are supported, and no command can modify mail.',
           '- `vault_gh({ credential, args })` runs the managed GitHub CLI (`gh`) with a controlled credential injected as GH_TOKEN. gh is downloaded on first use from the official cli/cli release and verified by SHA-256; `args` is an argv array, and `--json`/`--jq` keep output small. sealed/ephemeral credentials are refused.',
           '- `vault_transports()` lists the available transport channels, the policy fields each uses, and the actions/artifact sources each exposes. It is static metadata only.',
-          '- `vault_save({ id, source, dir?, filename?, maxBytes?, overwrite? })` writes bytes produced by a transport to a file inside `artifactAllowDirs` and returns only `{path, bytes, sha256}`. `source` is typed, e.g. `{ transport: "imap", mailbox, uid, part: "attachment:0" }` or `{ transport: "http", url, method }`. It never returns content; reading the saved path through other tools is blocked by the guard. Executable/script extensions are denied by default and the size cap is enforced.',
+          '- `vault_save({ id, source, dir?, filename?, maxBytes?, overwrite? })` writes bytes produced by a transport to a file inside `artifactAllowDirs` and returns only `{path, bytes, sha256}`. `source` is typed, e.g. `{ transport: "imap", mailbox, uid, part: "attachment:0" }` or `{ transport: "http", url, method }`. It never returns content. Files inside validated artifact directories are readable by other tools; a directory config that overlaps the vault store, DSH_HOME, credential files or spill dirs is rejected. Executable/script extensions are denied by default and the size cap is enforced.',
           '- For a `controlled` credential you may also write the placeholder `[[vault:<id>]]` inside a bash/pwsh command; the vault replaces it just before execution while the session log keeps the placeholder. `sealed` and `ephemeral` credentials must use `vault_http` or `vault_imap`.',
           '- Non-secret fields stored on a credential (for example `account_id` for Cloudflare) are shown by `vault_list` as names only; values stay hidden and can be referenced as `[[vault:<id>:<field>]]` in a bash/pwsh command, in a `vault_http` URL, or in its headers/body.',
           '- `ephemeral` credentials ask the user for confirmation on every use.',
@@ -1349,6 +1333,7 @@ export function apply(ctx, rawConfig) {
   // ------------------------------------------------------------------- api
 
   function vaultState() {
+    const artifactPolicy = vaultHost.artifact.status()
     return {
       vault: { unlocked: loaded, itemCount: Object.keys(data?.items ?? {}).length, path: storePath, storeKind },
       // ⚠ 2026-10-24 审计修复：这里原来直接 `itemMeta`，而 `itemMeta` 会把
@@ -1369,6 +1354,14 @@ export function apply(ctx, rawConfig) {
         denyPathReads: config.denyPathReads,
         denySpillReads: config.denySpillReads,
         maxResponseChars: config.maxResponseChars,
+        artifact: {
+          allowDirs: artifactPolicy.allowed,
+          rejected: artifactPolicy.rejected,
+          defaultDir: config.artifactDefaultDir,
+          autoDir: config.artifactAutoDir,
+          autoSave: config.artifactAutoSave === true,
+          maxBytes: toInt(config.artifactMaxBytes, 8 * 1024 * 1024, 1, 1024 * 1024 * 1024),
+        },
       },
       diag: { indexRenderCount },
     }
