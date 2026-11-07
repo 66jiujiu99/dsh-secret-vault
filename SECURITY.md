@@ -48,6 +48,19 @@
 - **guard 的路径保护是字面量匹配**：用 base64/变量/glob 拼路径即可绕过（同 UID 本来也不可防，见上）。
 
 
+## 2026-11-07 新增 IMAP 只读通道（0.5.0）
+
+`vault_imap` 在 Host 进程内建立隐式 TLS 的 IMAP4rev1 会话，用存储的凭证登录，只发送 `LOGIN` / `LIST` / `EXAMINE` / `UID SEARCH` / `UID FETCH` / `LOGOUT`。所有正文用 `BODY.PEEK`，不置 `\Seen`，没有 STORE/EXPUNGE/DELETE 等写路径。`sealed`/`ephemeral` 的值因此仍不需要进入子进程；`ephemeral` 每次使用照旧弹确认。
+
+新增通道的残余风险（如实记录）：
+
+- 与 `vault_http` 相同，host 只做主机名字符串校验，不校验解析后的 IP，不防 DNS rebinding；
+- 只支持隐式 TLS；STARTTLS（143）被明确拒绝。`imapAllowPlaintextLoopback` 只用于本机假服务器测试，默认关闭；
+- mailbox 名称与 SEARCH 条件只支持 ASCII，非 ASCII 会被拒绝（未实现 UTF-7 / CHARSET 转换）；
+- 邮件内容（头部、正文、附件名）仍是不可信数据：插件只负责凭证不泄漏与通道只读，不负责邮件正文里的 prompt injection。
+
+回归测试在 `test/harness.mjs` 的 IMAP 段：本地假服务器覆盖 LOGIN/LIST/SEARCH/FETCH 与字面量解析、只读命令断言、坏密码/超时/超大响应、非 ASCII 拒绝、结果与错误不含哨兵 secret。
+
 ## 处理原则
 
 - 凭证值不进入错误信息、审计、UI 响应；

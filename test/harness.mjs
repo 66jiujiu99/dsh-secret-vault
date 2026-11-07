@@ -3,6 +3,7 @@
  * Run: node test/harness.mjs
  */
 import { createServer } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -71,7 +72,13 @@ const ctx = {
 }
 
 const { apply } = await import('../index.js')
-apply(ctx, {})
+apply(ctx, {
+  imapAllowPlaintextLoopback: true,
+  imapConnectTimeoutMs: 1200,
+  imapCommandTimeoutMs: 3000,
+  imapMaxBufferBytes: 262144,
+  imapMaxLiteralBytes: 65536,
+})
 
 let failures = 0
 function check(label, ok, detail = '') {
@@ -106,6 +113,160 @@ function callApi(method, params, options = {}) {
 const SECRET = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
 const extraSecret = 'sk-test-0123456789abcdefghijklmn'
 
+// ── 本地假 IMAP 服务器（node:net）───────────────────────────────────────────
+// It speaks just enough IMAP4rev1 to prove the client frames literals, parses
+// LIST/SEARCH/FETCH, uses EXAMINE and never issues a write command.
+const IMAP_PASSWORD = 'imap-pass-0123456789'
+const IMAP_BAD_PASSWORD = 'WRONG-PASS-LEAK-9z8y7x'
+
+function mimeWord(text) {
+  return `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`
+}
+
+function imapHeadersFor(uid) {
+  const subjects = {
+    101: '月度账单 2026-10',
+    102: '银行对账单 2026-10',
+    // Deliberately echo the password in a header: the result must be scrubbed.
+    103: `支付宝账单 ${IMAP_PASSWORD}`,
+  }
+  return [
+    `From: ${mimeWord('账单机器人')} <billing@example.com>`,
+    `Subject: ${mimeWord(subjects[uid] ?? '账单')}`,
+    'Date: Fri, 06 Nov 2026 10:00:00 +0800',
+    `Message-ID: <m${uid}@example.com>`,
+    '',
+    '',
+  ].join('\r\n')
+}
+
+const IMAP_BODY_TEXT = '您的月度账单已生成，请查收。\r\n附件为 PDF 账单，共 1 个。\r\n'
+const IMAP_STRUCTURE = '(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 5 NIL NIL NIL NIL)("APPLICATION" "PDF" ("NAME" "bill-2026-10.pdf") NIL NIL "BASE64" 45678 NIL ("ATTACHMENT" ("FILENAME" "bill-2026-10.pdf")) NIL NIL) "MIXED" ("BOUNDARY" "b1") NIL NIL NIL)'
+
+function fetchLiteral(seq, uid, size, structure, section, literal) {
+  const body = Buffer.from(literal, 'utf8')
+  const head = `* ${seq} FETCH (UID ${uid} RFC822.SIZE ${size}${structure === null ? '' : ` BODYSTRUCTURE ${structure}`} ${section} {${body.length}}\r\n`
+  return Buffer.concat([Buffer.from(head, 'utf8'), body, Buffer.from(')\r\n', 'utf8')])
+}
+
+function startFakeImap(kind) {
+  const commands = []
+  const server = createNetServer((socket) => {
+    socket.setEncoding('utf8')
+    socket.on('error', () => {})
+    if (kind === 'silent') return
+    socket.write('* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN] fake QQMail ready\r\n')
+    let pending = ''
+    let authed = false
+    const send = (value) => socket.write(value)
+    const handle = (line) => {
+      commands.push(line)
+      const match = /^(\S+)\s+([\s\S]*)$/.exec(line)
+      if (match === null) return
+      const tag = match[1]
+      const rest = match[2]
+      const upper = rest.toUpperCase()
+      if (upper.startsWith('LOGIN ')) {
+        const args = /^LOGIN "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)"$/i.exec(rest)
+        if (args === null) {
+          send(`${tag} BAD LOGIN syntax\r\n`)
+          return
+        }
+        const user = args[1].replace(/\\(.)/g, '$1')
+        const pass = args[2].replace(/\\(.)/g, '$1')
+        if (user === 'billing@example.com' && pass === IMAP_PASSWORD) {
+          authed = true
+          send(`${tag} OK LOGIN completed\r\n`)
+        } else {
+          // Deliberately echo the submitted credential: the plugin must not relay it.
+          send(`${tag} NO [AUTHENTICATIONFAILED] LOGIN failed for ${rest}\r\n`)
+        }
+        return
+      }
+      if (upper.startsWith('CAPABILITY')) {
+        send('* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN\r\n')
+        send(`${tag} OK CAPABILITY completed\r\n`)
+        return
+      }
+      // Every mailbox command requires a successful login: this proves the client
+      // authenticated before it touched LIST/SEARCH/FETCH.
+      if (!authed && (upper.startsWith('LIST ') || upper.startsWith('EXAMINE ') || upper.startsWith('UID '))) {
+        send(`${tag} NO not authenticated\r\n`)
+        return
+      }
+      if (upper.startsWith('LIST ')) {
+        if (kind === 'huge') {
+          send('* LIST (\\HasNoChildren) "/" {999999999}\r\n')
+          return
+        }
+        send('* LIST (\\HasNoChildren) "/" "INBOX"\r\n')
+        send('* LIST (\\HasNoChildren \\Sent) "/" "Sent Messages"\r\n')
+        send('* LIST (\\HasNoChildren \\Drafts) "/" "Drafts"\r\n')
+        send(`${tag} OK LIST completed\r\n`)
+        return
+      }
+      if (upper.startsWith('EXAMINE ')) {
+        send('* 3 EXISTS\r\n')
+        send('* OK [UIDVALIDITY 42] UIDs valid\r\n')
+        send(`${tag} OK [READ-ONLY] EXAMINE completed\r\n`)
+        return
+      }
+      if (upper.startsWith('UID SEARCH')) {
+        send('* SEARCH 101 102 103\r\n')
+        send(`${tag} OK SEARCH completed\r\n`)
+        return
+      }
+      if (upper.startsWith('UID FETCH')) {
+        if (upper.includes('MESSAGE-ID')) {
+          send(fetchLiteral(1, 101, 1234, IMAP_STRUCTURE, 'BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]', imapHeadersFor(101)))
+          send(`${tag} OK FETCH completed\r\n`)
+          return
+        }
+        if (upper.includes('BODY.PEEK[TEXT]')) {
+          send(fetchLiteral(1, 101, 1234, IMAP_STRUCTURE, 'BODY[TEXT]', IMAP_BODY_TEXT))
+          send(`${tag} OK FETCH completed\r\n`)
+          return
+        }
+        const uidMatch = /^UID FETCH ([\d,]+) \(/i.exec(rest)
+        const uids = uidMatch === null ? [] : uidMatch[1].split(',').filter((entry) => /^\d+$/.test(entry))
+        uids.forEach((rawUid, index) => {
+          const uid = Number(rawUid)
+          if (![101, 102, 103].includes(uid)) return
+          send(fetchLiteral(index + 1, uid, 1000 + uid, null, 'BODY[HEADER.FIELDS (FROM SUBJECT DATE)]', imapHeadersFor(uid)))
+        })
+        send(`${tag} OK FETCH completed\r\n`)
+        return
+      }
+      if (upper.startsWith('LOGOUT')) {
+        send('* BYE logging out\r\n')
+        send(`${tag} OK LOGOUT completed\r\n`)
+        socket.end()
+        return
+      }
+      if (upper.startsWith('NOOP')) {
+        send(`${tag} OK NOOP completed\r\n`)
+        return
+      }
+      send(`${tag} BAD unknown command\r\n`)
+    }
+    socket.on('data', (chunk) => {
+      pending += chunk
+      let index = pending.indexOf('\r\n')
+      while (index !== -1) {
+        const line = pending.slice(0, index)
+        pending = pending.slice(index + 2)
+        handle(line)
+        index = pending.indexOf('\r\n')
+      }
+    })
+  })
+  return new Promise((resolvePromise) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolvePromise({ server, port: server.address().port, commands })
+    })
+  })
+}
+
 const server = createServer((req, res) => {
   let body = ''
   req.on('data', (chunk) => { body += chunk })
@@ -121,6 +282,10 @@ const server = createServer((req, res) => {
 })
 await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise))
 const port = server.address().port
+
+const imapNormal = await startFakeImap('normal')
+const imapHuge = await startFakeImap('huge')
+const imapSilent = await startFakeImap('silent')
 
 try {
   let state = await callApi('state')
@@ -480,7 +645,223 @@ try {
   const afterDelete = await callApi('state')
   check('state after delete', afterDelete.body.value.items.length === 2, JSON.stringify(afterDelete.body.value.items.map((i) => i.id)))
   check('audit has no secret', JSON.stringify(afterDelete.body.value.audit).includes(SECRET) === false)
+
+  // ── vault_imap：宿主内只读 IMAP 通道 ─────────────────────────────────────
+  // 目标：sealed 凭证也能读邮箱；值不出 Host；只读；错误与结果都不回显授权码。
+  check(
+    'vault_imap tool registered with no host/port inputs',
+    typeof tools.vault_imap === 'object'
+      && typeof tools.vault_imap.execute === 'function'
+      && tools.vault_imap.parameters.properties.host === undefined
+      && tools.vault_imap.parameters.properties.port === undefined,
+  )
+
+  const imapCall = (args, exec) => tools.vault_imap.execute(args, exec ?? { signal: new AbortController().signal, callId: 'imap-call' })
+  const imapError = async (args, exec) => imapCall(args, exec).then(() => null, (error) => error.message)
+  const imapSecret = `billing@example.com,${IMAP_PASSWORD}`
+
+  const savedImap = await callApi('save', {
+    id: 'imap-sealed', label: 'QQ 邮箱 账单', level: 'sealed', kind: 'password',
+    secret: imapSecret, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapNormal.port) },
+  })
+  check('save sealed IMAP credential', savedImap.body.ok === true, JSON.stringify(savedImap.body).slice(0, 200))
+
+  const imapList = await imapCall({ id: 'imap-sealed', action: 'list' })
+  check(
+    'vault_imap list returns mailboxes',
+    imapList.action === 'list'
+      && imapList.mailboxes.length === 3
+      && imapList.mailboxes.some((entry) => entry.name === 'INBOX')
+      && imapList.mailboxes.some((entry) => entry.name === 'Sent Messages')
+      && imapList.mailboxes[0].delimiter === '/',
+    JSON.stringify(imapList).slice(0, 300),
+  )
+
+  const imapSearchRes = await imapCall({
+    id: 'imap-sealed', action: 'search', mailbox: 'INBOX',
+    since: '2026-01-01', from: 'billing@example.com', subject: 'Bill', unseen: true, limit: 10,
+  })
+  check(
+    'vault_imap search returns UIDs',
+    imapSearchRes.total === 3 && imapSearchRes.uids.join(',') === '101,102,103',
+    JSON.stringify(imapSearchRes).slice(0, 300),
+  )
+  check(
+    'vault_imap search decodes RFC2047 subject and fills From/Date/size',
+    imapSearchRes.messages[0]?.subject.includes('月度账单')
+      && imapSearchRes.messages[0]?.from.includes('billing@example.com')
+      && imapSearchRes.messages[0]?.date.includes('2026')
+      && imapSearchRes.messages[0]?.size === 1101,
+    JSON.stringify(imapSearchRes.messages).slice(0, 300),
+  )
+  check(
+    'vault_imap SEARCH command carries the typed criteria',
+    imapNormal.commands.some((line) => line.includes('UID SEARCH')
+      && line.includes('SINCE 01-Jan-2026')
+      && line.includes('FROM "billing@example.com"')
+      && line.includes('SUBJECT "Bill"')
+      && line.includes('UNSEEN')),
+    'SEARCH criteria not observed',
+  )
+
+  const fetchHeaders = await imapCall({ id: 'imap-sealed', action: 'fetch', mailbox: 'INBOX', uid: 101, part: 'headers' })
+  check(
+    'vault_imap fetch returns headers by UID',
+    fetchHeaders.action === 'fetch'
+      && fetchHeaders.uid === 101
+      && fetchHeaders.size === 1234
+      && fetchHeaders.headers.includes('Subject:')
+      && fetchHeaders.headers.includes('Message-ID:'),
+    JSON.stringify(fetchHeaders).slice(0, 300),
+  )
+  check(
+    'vault_imap fetch exposes attachment metadata only',
+    fetchHeaders.attachments.length === 1
+      && fetchHeaders.attachments[0].filename === 'bill-2026-10.pdf'
+      && fetchHeaders.attachments[0].size === 45678
+      && fetchHeaders.attachments[0].type === 'application/pdf',
+    JSON.stringify(fetchHeaders.attachments),
+  )
+
+  const fetchText = await imapCall({ id: 'imap-sealed', action: 'fetch', mailbox: 'INBOX', uid: 101, part: 'text', maxChars: 4000 })
+  check(
+    'vault_imap fetch returns capped text',
+    typeof fetchText.text === 'string'
+      && fetchText.text.includes('您的月度账单')
+      && fetchText.text.includes('PDF')
+      && fetchText.attachments.length === 1,
+    JSON.stringify(fetchText).slice(0, 300),
+  )
+
+  const imapMissingUid = await imapError({ id: 'imap-sealed', action: 'fetch' })
+  check('vault_imap fetch requires a positive UID', imapMissingUid !== null && imapMissingUid.includes('uid'), String(imapMissingUid).slice(0, 160))
+
+  check(
+    'vault_imap logs in before mailbox commands',
+    imapNormal.commands.some((line) => /^SV\d+ LOGIN "/.test(line))
+      && imapNormal.commands.some((line) => /^SV\d+ EXAMINE /.test(line)),
+    'LOGIN/EXAMINE not observed',
+  )
+
+  const imapWriteOp = imapNormal.commands.some((line) => /\b(?:STORE|EXPUNGE|DELETE|COPY|MOVE|APPEND|CREATE|RENAME|SUBSCRIBE|UNSUBSCRIBE|SETACL)\b/i.test(line))
+  check(
+    'vault_imap is read-only (EXAMINE, no write commands)',
+    imapNormal.commands.some((line) => /\bEXAMINE\b/i.test(line))
+      && !imapNormal.commands.some((line) => /(?:^|\s)SELECT\s/i.test(line))
+      && !imapWriteOp,
+    'write command or SELECT observed',
+  )
+
+  check(
+    'vault_imap redacts a secret echoed by the server',
+    imapSearchRes.redacted === true
+      && imapSearchRes.messages[2]?.subject.includes('[[vault:imap-sealed]]')
+      && imapSearchRes.messages[2]?.subject.includes(IMAP_PASSWORD) === false,
+    JSON.stringify(imapSearchRes.messages[2] ?? {}),
+  )
+
+  const imapGuardHit = guards[0]({
+    name: 'vault_imap', callId: 'guard-imap',
+    arguments: { id: 'imap-sealed', action: 'search', subject: IMAP_PASSWORD },
+  })
+  check('guard denies a stored secret inside vault_imap arguments', typeof imapGuardHit === 'string' && imapGuardHit.includes('明文值'), String(imapGuardHit))
+
+  const imapListJson = await tools.vault_list.execute({}, {})
+  const imapOutputs = JSON.stringify({ imapList, imapSearchRes, fetchHeaders, fetchText, imapListJson })
+  check(
+    'vault_imap results and vault_list never contain the secret',
+    imapOutputs.includes(imapSecret) === false
+      && imapOutputs.includes(IMAP_PASSWORD) === false
+      && JSON.stringify(tools.vault_imap.output.render({}, fetchText)).includes(IMAP_PASSWORD) === false,
+    'secret leaked into IMAP output',
+  )
+
+  const imapBadSave = await callApi('save', {
+    id: 'imap-bad', label: 'IMAP 坏密码', level: 'sealed', kind: 'password',
+    secret: `billing@example.com,${IMAP_BAD_PASSWORD}`, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapNormal.port) },
+  })
+  check('save bad-password IMAP credential', imapBadSave.body.ok === true)
+  const imapBad = await imapError({ id: 'imap-bad', action: 'list' })
+  check(
+    'vault_imap bad password is rejected without echoing it',
+    imapBad !== null
+      && imapBad.includes('认证失败')
+      && imapBad.includes(IMAP_BAD_PASSWORD) === false,
+    String(imapBad).slice(0, 200),
+  )
+
+  const imapSlowSave = await callApi('save', {
+    id: 'imap-slow', label: 'IMAP 超时', level: 'sealed', kind: 'password',
+    secret: imapSecret, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapSilent.port) },
+  })
+  check('save slow IMAP credential', imapSlowSave.body.ok === true)
+  const imapSlow = await imapError({ id: 'imap-slow', action: 'list' })
+  check('vault_imap connect/banner timeout', imapSlow !== null && imapSlow.includes('超时'), String(imapSlow).slice(0, 200))
+
+  const imapHugeSave = await callApi('save', {
+    id: 'imap-huge', label: 'IMAP 超大响应', level: 'sealed', kind: 'password',
+    secret: imapSecret, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapHuge.port) },
+  })
+  check('save huge-response IMAP credential', imapHugeSave.body.ok === true)
+  const imapHugeError = await imapError({ id: 'imap-huge', action: 'list' })
+  check(
+    'vault_imap rejects oversized literal',
+    imapHugeError !== null && (imapHugeError.includes('过大') || imapHugeError.includes('上限')),
+    String(imapHugeError).slice(0, 200),
+  )
+
+  const nonAsciiBefore = imapNormal.commands.length
+  const imapNonAscii = await imapError({ id: 'imap-sealed', action: 'search', mailbox: '收件箱' })
+  check(
+    'vault_imap rejects non-ASCII mailbox without sending a command',
+    imapNonAscii !== null && imapNonAscii.includes('ASCII') && imapNormal.commands.length === nonAsciiBefore,
+    String(imapNonAscii).slice(0, 200),
+  )
+  const imapNonAsciiSubject = await imapError({ id: 'imap-sealed', action: 'search', subject: '账单' })
+  check(
+    'vault_imap rejects non-ASCII SEARCH string safely',
+    imapNonAsciiSubject !== null && imapNonAsciiSubject.includes('ASCII'),
+    String(imapNonAsciiSubject).slice(0, 200),
+  )
+
+  const imapControlledSave = await callApi('save', {
+    id: 'imap-controlled', label: 'IMAP controlled', level: 'controlled', kind: 'password',
+    secret: imapSecret, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapNormal.port) },
+  })
+  check('save controlled IMAP credential', imapControlledSave.body.ok === true)
+  const imapControlledList = await imapCall({ id: 'imap-controlled', action: 'list' })
+  check('vault_imap works for controlled credentials too', imapControlledList.action === 'list' && imapControlledList.mailboxes.length === 3)
+
+  const imapEphemeralSave = await callApi('save', {
+    id: 'imap-once', label: 'IMAP 一次性', level: 'ephemeral', kind: 'password',
+    secret: imapSecret, hosts: ['127.0.0.1'], methods: ['GET'],
+    meta: { imap_host: '127.0.0.1', imap_port: String(imapNormal.port) },
+  })
+  check('save ephemeral IMAP credential', imapEphemeralSave.body.ok === true)
+  const imapEphemeral = await imapError(
+    { id: 'imap-once', action: 'list' },
+    { signal: new AbortController().signal, callId: 'imap-once-call', agent: { id: 'sess-imap' } },
+  )
+  check('vault_imap ephemeral still requires confirmation', imapEphemeral !== null && imapEphemeral.includes('确认'), String(imapEphemeral).slice(0, 200))
+
+  const imapState = await callApi('state')
+  check(
+    'IMAP audit records actions without values',
+    Array.isArray(imapState.body.value.audit)
+      && imapState.body.value.audit.some((entry) => entry.action === 'imap:list')
+      && JSON.stringify(imapState.body.value).includes(imapSecret) === false
+      && JSON.stringify(imapState.body.value).includes(IMAP_PASSWORD) === false,
+    'audit/value leak',
+  )
 } finally {
+  imapNormal.server.close()
+  imapHuge.server.close()
+  imapSilent.server.close()
   server.close()
   await rm(home, { recursive: true, force: true })
 }

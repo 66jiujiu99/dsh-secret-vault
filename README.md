@@ -11,9 +11,10 @@
 
 云端模型要调用 GitHub、云厂商、内部 API，就必须用凭证；但凭证一旦进入 prompt、工具结果、文件读取或会话日志，就等于已经泄漏。
 
-这个插件把凭证放在 Host 进程的加密保险库里，只给模型两条「使用」通道：
+这个插件把凭证放在 Host 进程的加密保险库里，只给模型三条「使用」通道：
 
 - **HTTP 代理**：`vault_http` 在 Host 内发请求，认证头由插件注入，模型看不到值；
+- **宿主内 IMAP 只读通道**：`vault_imap` 在 Host 内登录 IMAP 并读取邮件，值同样不离开 Host；因此 `sealed`/`ephemeral` 也能读邮箱；
 - **占位符替换**：仅在 `controlled` 等级下，把 `[[vault:<id>]]` 在命令执行前替换成真值。
 
 同时用 `agent/pre-step`、`tools/post-execute`、`tools/ptc-dispatch-log` 三个「写日志前」闸门做脱敏，并用一个 deny-only 的 `ctx.tools.guard()` 拒绝把已知值、vault/spill 路径放进工具参数。
@@ -27,6 +28,7 @@
 - **全局**：profile 级插件，装一次，所有会话、子代理都能用；凭证保存后即时全局可见。
 - **只写不读**：没有 reveal 工具、没有读回接口；设置页保存后只显示 `••••（N 字符）`，忘记只能轮换。
 - **三级隐私等级**：`controlled` / `sealed` / `ephemeral`，按「值能去哪」而不是「加密强度」划分。
+- **宿主内 IMAP 只读通道**：`vault_imap` 支持 `list` / `search` / `fetch`，覆盖「用 sealed 凭证读邮箱」这类 HTTP 代理做不到的场景；只读命令白名单（`EXAMINE` + `BODY.PEEK`，没有 STORE/EXPUNGE/DELETE），TLS 证书校验开启，结果同样脱敏并有硬上限。
 - **域名 + 方法白名单**：`sealed`/`ephemeral` 只能访问声明的 host、使用声明的 HTTP 方法；不跟随重定向。
 - **结果脱敏**：已知值及其 JSON 转义 / base64 / hex / URL 编码 / Basic `base64(user:secret)` 变体都会被替换；常见 token 形态（`ghp_`、`sk-`、`AKIA`、私钥块、JWT…）即使不在库里也会被 pattern 脱敏。
 - **canonical `value` 也脱敏**：替换 `tools/post-execute` 的 value，让框架用脱敏后的值重算 content 与 presentation meta，堵住 PTC 程序/会话 meta 拿到裸值。
@@ -42,8 +44,8 @@
 
 | 等级 | 值能去哪 | 使用方式 | 适合 |
 |---|---|---|---|
-| `controlled` 受控 | 仅本次子进程的命令行/环境 | bash/pwsh 里写 `[[vault:<id>]]`；也可用 `vault_http` | 低风险 PAT、demo token |
-| `sealed` 密封 | **不进入子进程** | 只能 `vault_http`；必须配置 hosts/methods；非 loopback 强制 https | 高价值 API key、云厂商凭证 |
+| `controlled` 受控 | 仅本次子进程的命令行/环境 | bash/pwsh 里写 `[[vault:<id>]]`；也可用 `vault_http` / `vault_imap` | 低风险 PAT、demo token |
+| `sealed` 密封 | **不进入子进程** | `vault_http` 或 `vault_imap`；必须配置 hosts/methods；非 loopback 强制 https | 高价值 API key、云厂商凭证、邮箱授权码 |
 | `ephemeral` 一次性 | 同密封 | 同密封，且每次使用在会话里由用户确认；可选用后焚毁 | 真正一次性的 token |
 
 > `controlled` 本质是「提高成本」：值会进入一次子进程，同 UID 进程可以从命令行/环境读到。高价值凭证请用 `sealed`。
@@ -159,6 +161,60 @@ vault_http({
 - `redirect: manual`（不跟随跳转）；响应体截断到 `maxResponseChars` 并脱敏；
 - `sealed`/`ephemeral` 在非 loopback 下只允许 https。
 
+### `vault_imap`
+
+在 Host 进程内建立**只读 IMAP**（隐式 TLS）会话，用存储的凭证登录。值不出 Host，所以 `controlled` / `sealed` / `ephemeral` 都能用；`ephemeral` 仍然每次弹确认。
+
+```text
+vault_imap({
+  id: "qq-email",
+  action: "search",              // list | search | fetch
+  mailbox: "INBOX",              // 默认 INBOX；仅 ASCII
+  since: "2026-01-01",           // search：YYYY-MM-DD 或 DD-Mon-YYYY
+  before: "2026-11-01",          // search
+  from: "billing@example.com",   // search：FROM，仅 ASCII
+  subject: "Bill",               // search：SUBJECT，仅 ASCII
+  body: "invoice",               // search：BODY
+  text: "receipt",               // search：TEXT（仅 ASCII，见下）
+  unseen: true,                  // search：只找未读
+  limit: 20,                     // search：返回最新 N 封（默认 20，最大 100）
+  uid: 101,                      // fetch：来自 search 的 UID
+  part: "headers",               // fetch：headers（默认）| text
+  maxChars: 4000,                // fetch text：正文上限
+  timeoutMs: 60000
+})
+```
+
+返回：
+
+- `list`：`mailboxes[]`（`name` / `delimiter` / `attributes`，含 `\Sent` 等 SPECIAL-USE 属性）；
+- `search`：`total`、`uids[]`、`messages[]`（每封的 `uid` / `from` / `subject` / `date` / `size`），**不返回正文**；
+- `fetch`：`headers` 或受上限约束的 `text`，以及 `attachments[]`（**只有文件名/大小/类型，不返回二进制**）。
+
+连接参数不新增策略字段：
+
+| 参数 | 取值顺序 |
+|---|---|
+| host | 凭证附加字段 `imap_host`（必须命中 `hosts`）→ `hosts` 里优先含 `imap` 的具体主机 → 第一个具体主机 |
+| port | 凭证附加字段 `imap_port` → 默认 `993` |
+| username | 附加字段 `username` → `email` → secret 为 `user,pass` 时的前半段 |
+| password | secret 本身；secret 为 `user,pass` 时取后半段 |
+
+> `vault_imap` 只使用 `hosts` 作为目标白名单；`methods` 仅对 `vault_http` 生效。
+
+规则与限制：
+
+- **只读**：会话只发送 `LOGIN` / `LIST` / `EXAMINE` / `UID SEARCH` / `UID FETCH` / `LOGOUT`；用 `EXAMINE` 而不是 `SELECT`，所有正文都用 `BODY.PEEK`，读取不会置 `\Seen`；没有 STORE/EXPUNGE/DELETE/COPY/MOVE/APPEND 之类写路径；
+- **TLS**：隐式 TLS，校验证书与主机名；不支持 STARTTLS（143 会被明确拒绝），不会静默降级为明文；
+- **ASCII**：mailbox 名与 SEARCH 字符串只支持 ASCII（暂未实现 IMAP UTF-7/CHARSET 编码），非 ASCII 会直接拒绝并提示，不会发出半截命令；
+- **上限**：连接/单命令/整体超时，缓冲区、单条字面量、响应记录数、邮件头/正文/附件元数据数量都有硬上限；
+- **脱敏**：邮箱头、正文、附件名、错误信息都走与 `vault_http` 相同的 `redactText`；登录失败的服务器回显不会进入错误信息；审计只记录 `imap:list` / `imap:search` / `imap:fetch`；
+- **测试开关**：`imapAllowPlaintextLoopback`（默认 `false`）只允许 loopback 主机走明文 TCP，供本地假服务器测试；生产不要开启。
+
+可配置项（profile patch）：`imapConnectTimeoutMs`（15000）、`imapCommandTimeoutMs`（20000）、`imapTimeoutMs`（60000）、`imapMaxHeaderChars`（8000）、`imapMaxTextChars`（12000）、`imapMaxTextBytes`（65536）、`imapMaxBufferBytes`（2 MiB）、`imapMaxLiteralBytes`（512 KiB）、`imapMaxRecords`（5000）、`imapMaxMailboxes`（200）。
+
+> 邮件内容本身仍是不可信数据：`vault_imap` 只保证凭证不泄漏、通道只读，不会把邮件正文当指令执行。
+
 ### 占位符（仅 `controlled`）
 
 ```text
@@ -235,6 +291,7 @@ vault_gh({
 - 凭证值不出现在 `vault_list`、`state`、设置页、工具结果、会话消息、PTC 日志里；
 - 常见编码变体与 token 形态会被脱敏；
 - `sealed`/`ephemeral` 不会把值交给任何子进程；
+- `vault_imap` 的 IMAP 会话在 Host 内完成，值不进入工具参数/结果/子进程；只发送只读命令，`EXAMINE` + `BODY.PEEK` 不置 `\Seen`，没有 STORE/EXPUNGE/DELETE 等写路径；
 - 读取 vault、spill、子进程日志、`.credentials.yaml` 会被 guard 拒绝；
 - 管理面不能把 `sealed` 静默降级为 `controlled`。
 
@@ -242,7 +299,7 @@ vault_gh({
 
 - Host 内存里保存全部明文与页面令牌，同 UID 的调试器/`OpenProcess` 可直接读；
 - DPAPI 可被同用户进程解密；vault 文件可被删除/替换；
-- `controlled` 的值会进入子进程命令行/环境，WMI/进程列表可读；`curl --connect-to` 等可绕过 hosts 校验；`vault_gh` 的 `GH_TOKEN` 同理；
+- `controlled` 的值会进入子进程命令行/环境，WMI/进程列表可读；`curl --connect-to` 等可绕过 hosts 校验；`vault_gh` 的 `GH_TOKEN` 同理；`vault_imap` 也只比较主机名字符串，不校验解析后的 IP（不防 DNS rebinding），且 mailbox/SEARCH 只支持 ASCII；
 - assistant 消息、compaction 摘要、`tool/call` 参数、PTC `tool/ptc-dispatch.arguments` 没有可用的写日志前改写缝；
 - 如果 profile 暴露 `plugin_manager`（装 Host 代码）、`cordis_run`（执行 Host JS）或允许 MCP 读取本地路径，任何进程内 vault 都可被绕过；
 - 插件**不阻止误删仓库**：它保护的是凭证不泄漏，不是操作审批。需要人工把关时用 `ephemeral`，或使用 GitHub 侧的组织策略/审计。
@@ -259,9 +316,15 @@ vault_gh({
 node test/harness.mjs
 ```
 
-覆盖：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝。
+覆盖：存储非明文、列表/响应不含值、host/method 拒绝、占位符替换、三级语义、guard、pre-step/post-execute 脱敏、canonical value 脱敏、管理 API（令牌/JSON 兜底）、短 secret 拒绝、策略字段不可变、Basic auth 回显脱敏、spill/子进程文件回写、审计不含值、`vault_gh` 的等级/子命令/参数拒绝，以及 `vault_imap`（本地假 IMAP 服务器：LOGIN/LIST/SEARCH/FETCH 与字面量、只读命令断言、坏密码/超时/超大响应、非 ASCII 拒绝、结果与错误不含哨兵 secret）。
 
 `test/echo-server.mjs` 是本地回显服务，用于验证认证头注入与脱敏。
+
+`test/imap-tls-probe.mjs` 是不登录的真实 TLS 探测（默认 `imap.qq.com:993`），用于确认握手与 banner 解析：
+
+```bash
+node test/imap-tls-probe.mjs imap.qq.com 993
+```
 
 ---
 
@@ -269,6 +332,7 @@ node test/harness.mjs
 
 ```text
 index.js            Host half：存储、工具、钩子、guard、管理 API
+imap.js             宿主内只读 IMAP4rev1 客户端（无 npm 依赖）
 client.js           Web UI（Settings → 凭证保险库）
 cordis.patch.yml    profile bundle patch
 locale/*.json       插件元数据（中/英）
