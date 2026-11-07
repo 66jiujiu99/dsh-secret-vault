@@ -4,13 +4,21 @@
  */
 import { createServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
+import { createArtifactSink } from '../artifacts.js'
 
 const home = await mkdtemp(join(tmpdir(), 'sv-test-'))
 process.env.DSH_HOME = home
+const artifactRoot = await mkdtemp(join(tmpdir(), 'sv-artifact-'))
+const artifactDir = join(artifactRoot, 'allowed')
+const outsideDir = join(artifactRoot, 'outside')
+const autoDir = join(artifactRoot, 'auto')
+await mkdir(artifactDir, { recursive: true })
+await mkdir(outsideDir, { recursive: true })
+await mkdir(autoDir, { recursive: true })
 
 const handlers = {}
 const tools = {}
@@ -78,6 +86,10 @@ apply(ctx, {
   imapCommandTimeoutMs: 3000,
   imapMaxBufferBytes: 262144,
   imapMaxLiteralBytes: 65536,
+  artifactAllowDirs: [artifactDir, autoDir],
+  artifactDefaultDir: artifactDir,
+  artifactAutoDir: autoDir,
+  artifactMaxBytes: 1024 * 1024,
 })
 
 let failures = 0
@@ -142,6 +154,13 @@ function imapHeadersFor(uid) {
 
 const IMAP_BODY_TEXT = '您的月度账单已生成，请查收。\r\n附件为 PDF 账单，共 1 个。\r\n'
 const IMAP_STRUCTURE = '(("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 120 5 NIL NIL NIL NIL)("APPLICATION" "PDF" ("NAME" "bill-2026-10.pdf") NIL NIL "BASE64" 45678 NIL ("ATTACHMENT" ("FILENAME" "bill-2026-10.pdf")) NIL NIL) "MIXED" ("BOUNDARY" "b1") NIL NIL NIL)'
+const IMAP_ATTACHMENT_BYTES = Buffer.from('%PDF-1.4\nFAKE-BILL-SENTINEL-0123456789\n', 'utf8')
+const IMAP_ATTACHMENT_BASE64 = IMAP_ATTACHMENT_BYTES.toString('base64').replace(/(.{76})/g, '$1\r\n')
+const IMAP_ATTACHMENT_OCTETS = Buffer.byteLength(IMAP_ATTACHMENT_BASE64, 'utf8')
+// The vault_imap metadata assertion keeps the historical 45678-octet fixture; the
+// attachment-download path needs a BODYSTRUCTURE whose octet count matches the bytes
+// the fake server actually returns (the completeness check compares the two).
+const IMAP_ATTACHMENT_STRUCTURE = IMAP_STRUCTURE.replace('45678', String(IMAP_ATTACHMENT_OCTETS))
 
 function fetchLiteral(seq, uid, size, structure, section, literal) {
   const body = Buffer.from(literal, 'utf8')
@@ -217,6 +236,16 @@ function startFakeImap(kind) {
         return
       }
       if (upper.startsWith('UID FETCH')) {
+        if (upper.includes('BODYSTRUCTURE') && !upper.includes('BODY.PEEK[')) {
+          send(`* 1 FETCH (UID 101 RFC822.SIZE 1234 BODYSTRUCTURE ${IMAP_ATTACHMENT_STRUCTURE})\r\n`)
+          send(`${tag} OK FETCH completed\r\n`)
+          return
+        }
+        if (upper.includes('BODY.PEEK[2]')) {
+          send(fetchLiteral(1, 101, 1234, null, 'BODY[2]', IMAP_ATTACHMENT_BASE64))
+          send(`${tag} OK FETCH completed\r\n`)
+          return
+        }
         if (upper.includes('MESSAGE-ID')) {
           send(fetchLiteral(1, 101, 1234, IMAP_STRUCTURE, 'BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]', imapHeadersFor(101)))
           send(`${tag} OK FETCH completed\r\n`)
@@ -268,6 +297,17 @@ function startFakeImap(kind) {
 }
 
 const server = createServer((req, res) => {
+  if (req.url === '/artifact.pdf') {
+    res.setHeader('content-type', 'application/pdf')
+    res.setHeader('content-disposition', 'attachment; filename="http-bill.pdf"')
+    res.end(Buffer.from('%PDF-1.4\nHTTP-SENTINEL-0123456789\n', 'utf8'))
+    return
+  }
+  if (req.url === '/large') {
+    res.setHeader('content-type', 'text/plain; charset=utf-8')
+    res.end(`${'X'.repeat(200000)}FULL-TAIL-SENTINEL`)
+    return
+  }
   let body = ''
   req.on('data', (chunk) => { body += chunk })
   req.on('end', () => {
@@ -627,16 +667,16 @@ try {
     check(`guard still denies ${probe.label}`, typeof decision === 'string', String(decision))
   }
 
-  const artifactDir = await mkdtemp(join(tmpdir(), 'dsh-subprocess-test-'))
-  const artifactFile = join(artifactDir, 'out.log')
-  await writeFile(artifactFile, `head ${extraSecret}\nghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ\n`, 'utf8')
-  const noticeBlocks = [{ type: 'text', text: `[...]\n\n[output truncated; full output: ${artifactFile}]` }]
+  const spillDir = await mkdtemp(join(tmpdir(), 'dsh-subprocess-test-'))
+  const spillFile = join(spillDir, 'out.log')
+  await writeFile(spillFile, `head ${extraSecret}\n${'ghp_' + 'Z'.repeat(36)}\n`, 'utf8')
+  const noticeBlocks = [{ type: 'text', text: `[...]\n\n[output truncated; full output: ${spillFile}]` }]
   await handlers['tools/post-execute'](
     { name: 'pwsh', callId: 'call-9' },
     { isError: false, value: null, content: noticeBlocks },
     async () => ({ kind: 'accept' }),
   )
-  const artifactAfter = await readFile(artifactFile, 'utf8')
+  const artifactAfter = await readFile(spillFile, 'utf8')
   check('post-execute scrubs subprocess artifact file', artifactAfter.includes(extraSecret) === false && artifactAfter.includes('ghp_ZZZ') === false, artifactAfter.slice(0, 120))
 
   const deleteResult = await callApi('delete', { id: 'test-token' })
@@ -858,12 +898,226 @@ try {
       && JSON.stringify(imapState.body.value).includes(IMAP_PASSWORD) === false,
     'audit/value leak',
   )
+  // ── 通道注册表 + 通用产物出口 ─────────────────────────────
+  check(
+    'transport move preserved existing tool schemas',
+    tools.vault_http.parameters.required.join(',') === 'id,method,url'
+      && tools.vault_imap.parameters.required.join(',') === 'id,action'
+      && tools.vault_gh.parameters.required.join(',') === 'credential,args',
+  )
+  check('vault_transports tool registered', typeof tools.vault_transports === 'object' && typeof tools.vault_transports.execute === 'function')
+  const transportInfo = await tools.vault_transports.execute({}, {})
+  const transportIds = transportInfo.transports.map((entry) => entry.id)
+  check(
+    'vault_transports lists the registered transports',
+    transportIds.includes('http') && transportIds.includes('imap') && transportIds.includes('gh'),
+    JSON.stringify(transportIds),
+  )
+  check(
+    'transport introspection exposes actions and artifact sources',
+    transportInfo.transports.find((entry) => entry.id === 'imap')?.artifactSources.some((source) => source.id === 'imap')
+      && transportInfo.transports.find((entry) => entry.id === 'http')?.artifactSources.some((source) => source.id === 'http')
+      && transportInfo.transports.find((entry) => entry.id === 'gh')?.artifactSources.length === 0,
+    JSON.stringify(transportInfo).slice(0, 500),
+  )
+
+  check('vault_save tool registered', typeof tools.vault_save === 'object' && typeof tools.vault_save.execute === 'function')
+  check(
+    'vault_save schema uses a typed source object',
+    tools.vault_save.parameters.properties.source?.type === 'object'
+      && tools.vault_save.parameters.properties.source?.required?.includes('transport'),
+  )
+
+  const artifactExec = () => ({ signal: new AbortController().signal, callId: 'artifact-call' })
+  const saveCall = (args, exec) => tools.vault_save.execute(args, exec ?? artifactExec())
+  const saveError = async (args, exec) => saveCall(args, exec).then(() => null, (error) => error.message)
+  const attachmentSource = { transport: 'imap', mailbox: 'INBOX', uid: 101, part: 'attachment:0' }
+
+  const savedImapArtifact = await saveCall({
+    id: 'imap-sealed', source: attachmentSource, dir: artifactDir,
+  })
+  check(
+    'vault_save writes the IMAP attachment',
+    savedImapArtifact.transport === 'imap'
+      && savedImapArtifact.bytes === IMAP_ATTACHMENT_BYTES.length
+      && savedImapArtifact.path.endsWith('bill-2026-10.pdf')
+      && /^[0-9a-f]{16}$/.test(savedImapArtifact.sha256),
+    JSON.stringify(savedImapArtifact),
+  )
+  check(
+    'vault_save return value never contains file content',
+    JSON.stringify(savedImapArtifact).includes('FAKE-BILL-SENTINEL') === false
+      && JSON.stringify(savedImapArtifact).includes('%PDF') === false,
+    JSON.stringify(savedImapArtifact),
+  )
+  const savedImapBytes = await readFile(savedImapArtifact.path)
+  check('vault_save file is the decoded attachment, not base64', savedImapBytes.equals(IMAP_ATTACHMENT_BYTES))
+
+  const savedTextArtifact = await saveCall({
+    id: 'imap-sealed', source: { transport: 'imap', mailbox: 'INBOX', uid: 101, part: 'text' },
+    dir: artifactDir, filename: 'bill.txt',
+  })
+  const savedTextBytes = await readFile(savedTextArtifact.path, 'utf8')
+  check('vault_save writes an IMAP text part through the same sink', savedTextBytes.includes('您的月度账单'))
+
+  const savedHttpArtifact = await saveCall({
+    id: 'sealed-token',
+    source: { transport: 'http', url: `http://127.0.0.1:${port}/artifact.pdf`, method: 'GET' },
+    dir: artifactDir,
+  })
+  check(
+    'vault_save writes an HTTP response with content-disposition filename',
+    savedHttpArtifact.transport === 'http'
+      && savedHttpArtifact.path.endsWith('http-bill.pdf')
+      && savedHttpArtifact.bytes === Buffer.byteLength('%PDF-1.4\nHTTP-SENTINEL-0123456789\n')
+      && savedHttpArtifact.contentType.includes('application/pdf'),
+    JSON.stringify(savedHttpArtifact),
+  )
+  check(
+    'vault_save HTTP return never contains the response body',
+    JSON.stringify(savedHttpArtifact).includes('HTTP-SENTINEL') === false,
+    JSON.stringify(savedHttpArtifact),
+  )
+
+  const outsideError = await saveError({ id: 'imap-sealed', source: attachmentSource, dir: outsideDir })
+  check('vault_save rejects a directory outside artifactAllowDirs', outsideError !== null && outsideError.includes('白名单'), String(outsideError).slice(0, 200))
+  const traversalError = await saveError({ id: 'imap-sealed', source: attachmentSource, dir: join(artifactDir, '..', 'outside') })
+  check('vault_save rejects .. traversal', traversalError !== null && traversalError.includes('白名单'), String(traversalError).slice(0, 200))
+
+  const escapeLink = join(artifactDir, 'escape-link')
+  let escapeLinkCreated = false
+  try {
+    await symlink(outsideDir, escapeLink, 'junction')
+    escapeLinkCreated = true
+  } catch {
+    /* Windows may deny symlink creation; the check below reports it explicitly */
+  }
+  const symlinkError = escapeLinkCreated
+    ? await saveError({ id: 'imap-sealed', source: attachmentSource, dir: escapeLink, filename: 'symlink.pdf' })
+    : 'symlink creation unavailable'
+  check(
+    'vault_save rejects a symlink/junction escaping the allowlist',
+    escapeLinkCreated && symlinkError !== null && symlinkError.includes('白名单'),
+    String(symlinkError).slice(0, 200),
+  )
+
+  const noReplace = await saveError({ id: 'imap-sealed', source: attachmentSource, dir: artifactDir })
+  check('vault_save refuses to overwrite by default', noReplace !== null && noReplace.includes('已存在'), String(noReplace).slice(0, 200))
+
+  const replaceFirst = await saveCall({
+    id: 'imap-sealed', source: attachmentSource, dir: artifactDir, filename: 'replace.pdf',
+  })
+  const replaceSecond = await saveCall({
+    id: 'sealed-token',
+    source: { transport: 'http', url: `http://127.0.0.1:${port}/artifact.pdf`, method: 'GET' },
+    dir: artifactDir, filename: 'replace.pdf', overwrite: true,
+  })
+  const replacedBytes = await readFile(replaceSecond.path)
+  check(
+    'vault_save overwrite:true replaces the file atomically',
+    replaceFirst.sha256 !== replaceSecond.sha256
+      && replacedBytes.equals(Buffer.from('%PDF-1.4\nHTTP-SENTINEL-0123456789\n', 'utf8')),
+    JSON.stringify({ first: replaceFirst.sha256, second: replaceSecond.sha256 }),
+  )
+
+  const tooBig = await saveError({ id: 'imap-sealed', source: attachmentSource, dir: artifactDir, filename: 'big.pdf', maxBytes: 16 })
+  check('vault_save enforces the size cap without truncation', tooBig !== null && tooBig.includes('超过'), String(tooBig).slice(0, 200))
+  const overConfigured = await saveError({ id: 'imap-sealed', source: attachmentSource, maxBytes: 2 * 1024 * 1024 })
+  check('vault_save cannot raise maxBytes above config', overConfigured !== null && overConfigured.includes('不能超过配置上限'), String(overConfigured).slice(0, 200))
+  const executable = await saveError({ id: 'imap-sealed', source: attachmentSource, dir: artifactDir, filename: 'evil.exe' })
+  check('vault_save rejects executable extensions by default', executable !== null && executable.includes('扩展名'), String(executable).slice(0, 200))
+
+  const atomicDir = join(artifactRoot, 'atomic')
+  await mkdir(atomicDir, { recursive: true })
+  const failingSink = createArtifactSink({
+    config: {
+      artifactAllowDirs: [atomicDir],
+      artifactDefaultDir: atomicDir,
+      artifactMaxBytes: 1024,
+      artifactDeniedExtensions: [],
+    },
+    host: {
+      toInt: (value, fallback, min, max) => {
+        const parsed = Number.parseInt(String(value ?? fallback), 10)
+        return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.trunc(parsed))) : fallback
+      },
+      findSecret: () => null,
+    },
+    fsOps: { rename: async () => { throw new Error('injected rename failure') } },
+  })
+  const atomicError = await failingSink.saveBuffer(
+    { data: Buffer.from('atomic'), filename: 'atomic.pdf', contentType: 'application/pdf' },
+    { dir: atomicDir },
+  ).then(() => null, (error) => error.message)
+  const atomicLeft = await readdir(atomicDir)
+  check(
+    'artifact atomic-write failure leaves no temp or partial file',
+    atomicError !== null && atomicError.includes('injected rename failure') && atomicLeft.length === 0,
+    JSON.stringify({ atomicError, atomicLeft }),
+  )
+
+  const artifactReadGuard = guards[0]({
+    name: 'read', callId: 'guard-artifact', arguments: { file_path: savedImapArtifact.path },
+  })
+  check(
+    'guard denies reading a saved artifact',
+    typeof artifactReadGuard === 'string' && artifactReadGuard.includes('落盘产物目录'),
+    String(artifactReadGuard),
+  )
+  const artifactSaveGuard = guards[0]({
+    name: 'vault_save', callId: 'guard-artifact-save',
+    arguments: { id: 'imap-sealed', source: attachmentSource, dir: artifactDir },
+  })
+  check('guard allows vault_save into the artifact directory', typeof artifactSaveGuard === 'undefined', String(artifactSaveGuard))
+
+  const largeHttp = await tools.vault_http.execute(
+    { id: 'sealed-token', method: 'GET', url: `http://127.0.0.1:${port}/large` },
+    artifactExec(),
+  )
+  check(
+    'large HTTP response is still truncated when artifactAutoSave is off',
+    largeHttp.truncated === true
+      && largeHttp.artifact === undefined
+      && largeHttp.body.length <= 24000
+      && largeHttp.body.includes('FULL-TAIL-SENTINEL') === false,
+    JSON.stringify({ truncated: largeHttp.truncated, artifact: largeHttp.artifact, length: largeHttp.body.length }),
+  )
+
+  const unknownTransport = await saveError({ id: 'imap-sealed', source: { transport: 'smtp' }, dir: artifactDir })
+  check('vault_save rejects an unknown transport', unknownTransport !== null && unknownTransport.includes('未知 transport'), String(unknownTransport).slice(0, 200))
+  const noArtifactTransport = await saveError({ id: 'sealed-token', source: { transport: 'gh' }, dir: artifactDir })
+  check('vault_save rejects a transport without artifact support', noArtifactTransport !== null && noArtifactTransport.includes('不支持落盘取数'), String(noArtifactTransport).slice(0, 200))
+  const badSource = await saveError({ id: 'imap-sealed' })
+  check('vault_save requires a typed source object', badSource !== null && badSource.includes('source 必须是对象'), String(badSource).slice(0, 200))
+  const ephemeralArtifact = await saveError(
+    { id: 'imap-once', source: attachmentSource, dir: artifactDir },
+    { signal: new AbortController().signal, callId: 'artifact-once', agent: { id: 'sess-artifact' } },
+  )
+  check('vault_save ephemeral still requires confirmation', ephemeralArtifact !== null && ephemeralArtifact.includes('确认'), String(ephemeralArtifact).slice(0, 200))
+
+  const artifactState = await callApi('state')
+  const artifactAudit = JSON.stringify(artifactState.body.value.audit)
+  check(
+    'artifact audit records actions without paths or data',
+    artifactAudit.includes('save:imap')
+      && artifactAudit.includes('save:http')
+      && artifactAudit.includes(artifactDir) === false
+      && artifactAudit.includes('FAKE-BILL-SENTINEL') === false
+      && artifactAudit.includes('HTTP-SENTINEL') === false,
+    artifactAudit.slice(0, 300),
+  )
+  check(
+    'artifact state does not expose the output directory',
+    JSON.stringify(artifactState.body.value).includes(artifactDir) === false,
+    'artifact path leaked into state',
+  )
 } finally {
   imapNormal.server.close()
   imapHuge.server.close()
   imapSilent.server.close()
   server.close()
   await rm(home, { recursive: true, force: true })
+  await rm(artifactRoot, { recursive: true, force: true })
 }
 
 console.log(failures === 0 ? 'ALL PASS' : `${failures} FAILURE(S)`)

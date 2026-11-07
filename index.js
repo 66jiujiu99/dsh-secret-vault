@@ -9,35 +9,31 @@
  *  - a deny-only guard refuses tool arguments that contain a known value and refuses reads of
  *    the vault, spill files, and the harness credential file;
  *  - `controlled` items may be substituted into bash/pwsh through `[[vault:<id>]]`;
- *    `sealed`/`ephemeral` items can only be used by the in-process HTTP broker, and `ephemeral`
- *    additionally asks the user for confirmation on every use.
+ *    `sealed`/`ephemeral` items can only be used by in-process transports (HTTP / IMAP),
+ *    and `ephemeral` additionally asks the user for confirmation on every use.
  *
  * Storage is DPAPI-protected on Windows (AES-256-GCM with an owner-only key file elsewhere),
  * decrypted lazily into Host memory only.
  */
 import { spawn } from 'node:child_process'
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
-import { existsSync, readdirSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, relative, resolve, sep } from 'node:path'
-import { buildSearchCriteria, openImapSession, parseHeaderBlock } from './imap.js'
+import { createArtifactSink, createArtifactTool } from './artifacts.js'
+import { createTransportRegistry, createTransportsTool } from './transports/registry.js'
+import { HTTP_METHODS } from './transports/http.js'
+import { transportFactories } from './transports/index.js'
 
 export const name = 'secret-vault'
 export const inject = ['tools']
 
 const LEVELS = ['controlled', 'sealed', 'ephemeral']
-const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']
 const AUTH_TYPES = ['bearer', 'basic', 'header', 'query']
 const PLACEHOLDER_RE = /\[\[vault:([a-z0-9][a-z0-9._-]{0,63})\]\]/g
 const META_PLACEHOLDER_RE = /\[\[vault:([a-z0-9][a-z0-9._-]{0,63}):([a-z0-9][a-z0-9._-]{0,63})\]\]/g
 const SUBSTITUTABLE_TOOLS = new Set(['bash', 'pwsh'])
-const FORBIDDEN_REQUEST_HEADERS = new Set([
-  'authorization', 'proxy-authorization', 'cookie', 'host', 'content-length',
-  'connection', 'transfer-encoding', 'upgrade', 'te', 'trailer',
-  'x-http-method-override', 'x-method-override', 'forwarded', 'x-real-ip',
-  'x-original-url', 'x-rewrite-url',
-])
 const SECRET_PATTERNS = [
   [/\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, 'github-token'],
   [/\bgithub_pat_[A-Za-z0-9_]{30,}\b/g, 'github-pat'],
@@ -78,11 +74,15 @@ const DEFAULTS = {
   imapMaxHeaderChars: 8000,
   imapMaxTextChars: 12000,
   imapMaxTextBytes: 65536,
+  artifactAllowDirs: [],
+  artifactDefaultDir: '',
+  artifactMaxBytes: 8 * 1024 * 1024,
+  artifactAutoSave: false,
+  artifactAutoDir: '',
+  artifactDeniedExtensions: [],
+  artifactAllowedExtensions: [],
+  artifactTimeoutMs: 120000,
 }
-
-const GH_REPO_API = 'https://api.github.com/repos/cli/cli/releases'
-const GH_DENIED_COMMANDS = new Set(['extension', 'alias', 'config', 'auth'])
-const GH_DENIED_FLAGS = new Set(['--hostname', '--show-token'])
 
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error)
@@ -309,6 +309,33 @@ function protectedPathReason(tokens, storeDir, dshHome) {
   return null
 }
 
+/**
+ * Deny reading files that live under a configured artifact directory.
+ *
+ * `vault_save` itself is exempt in the guard: it is the only writer, it never returns
+ * content, and its `dir` argument must be inside the allowlist. Every other tool that
+ * names a path in one of these roots (read/glob/grep/bash/pwsh/terminal_send/...) is
+ * refused, so a saved credential-bearing response cannot be read straight back.
+ */
+function protectedArtifactReason(tokens, dirs) {
+  const roots = []
+  for (const entry of Array.isArray(dirs) ? dirs : []) {
+    if (typeof entry !== 'string' || entry.trim() === '') continue
+    const root = canonicalPath(resolve(entry)).replace(/\/+$/, '')
+    if (root !== '') roots.push(root)
+  }
+  if (roots.length === 0) return null
+  for (const token of tokens) {
+    if (!isFileNamingToken(token)) continue
+    const path = canonicalPath(token).replace(/\/+$/, '')
+    if (path === '') continue
+    for (const root of roots) {
+      if (path === root || path.startsWith(`${root}/`)) return 'artifact output directory'
+    }
+  }
+  return null
+}
+
 /** Collect every string leaf, optionally skipping object keys that are prose/patch content. */
 function collectStringLeaves(value, skipKeys = null, out = [], depth = 0) {
   if (depth > 12) return out
@@ -412,312 +439,6 @@ export function apply(ctx, rawConfig) {
     const run = useChain.catch(() => {}).then(operation)
     useChain = run.catch(() => {})
     return run
-  }
-
-  // ---------------------------------------------------------- managed gh CLI
-
-  function ghAssetTarget() {
-    let platform
-    let assetPlatform
-    let extension
-    if (process.platform === 'win32') {
-      platform = 'win32'
-      assetPlatform = 'windows'
-      extension = 'zip'
-    } else if (process.platform === 'darwin') {
-      platform = 'darwin'
-      assetPlatform = 'macOS'
-      extension = 'zip'
-    } else if (process.platform === 'linux') {
-      platform = 'linux'
-      assetPlatform = 'linux'
-      extension = 'tar.gz'
-    } else {
-      throw new Error(`vault_gh: 不支持的平台 ${process.platform}`)
-    }
-    const arch = process.arch === 'x64' ? 'amd64'
-      : process.arch === 'arm64' ? 'arm64'
-        : process.arch === 'ia32' ? '386'
-          : process.arch
-    return { platform, assetPlatform, arch, extension, binaryName: platform === 'win32' ? 'gh.exe' : 'gh' }
-  }
-
-  function runCaptured(command, args, options = {}) {
-    return new Promise((resolvePromise, reject) => {
-      let child
-      try {
-        child = spawn(command, args, {
-          cwd: options.cwd,
-          env: options.env,
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
-      } catch (error) {
-        reject(error)
-        return
-      }
-      const limit = options.limit ?? 1024 * 1024
-      let stdout = ''
-      let stderr = ''
-      let settled = false
-      const finish = (error, code, signal) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        if (options.signal) options.signal.removeEventListener('abort', onAbort)
-        if (error) reject(error)
-        else resolvePromise({ code, signal, stdout, stderr })
-      }
-      const onAbort = () => {
-        try { child.kill() } catch { /* ignore */ }
-        finish(new Error('aborted'))
-      }
-      const timer = setTimeout(() => {
-        try { child.kill() } catch { /* ignore */ }
-        finish(new Error(`超时（${options.timeoutMs ?? 60000}ms）`))
-      }, options.timeoutMs ?? 60000)
-      timer.unref?.()
-      if (options.signal) {
-        if (options.signal.aborted) onAbort()
-        else options.signal.addEventListener('abort', onAbort, { once: true })
-      }
-      child.stdout?.setEncoding('utf8')
-      child.stderr?.setEncoding('utf8')
-      child.stdout?.on('data', (chunk) => { if (stdout.length < limit) stdout += chunk })
-      child.stderr?.on('data', (chunk) => { if (stderr.length < limit) stderr += chunk })
-      child.on('error', (error) => finish(error))
-      child.on('close', (code, signal) => finish(null, code, signal))
-    })
-  }
-
-  async function fetchGhRelease() {
-    const pinned = cleanString(String(config.ghVersion ?? ''), 32).replace(/^v/, '')
-    const url = pinned === '' ? `${GH_REPO_API}/latest` : `${GH_REPO_API}/tags/v${pinned}`
-    const response = await fetch(url, {
-      headers: { accept: 'application/vnd.github+json', 'user-agent': 'dsh-secret-vault' },
-      signal: AbortSignal.timeout(config.ghDownloadTimeoutMs),
-    })
-    if (!response.ok) throw new Error(`GitHub release API HTTP ${response.status}`)
-    return await response.json()
-  }
-
-  function findGhBinary(directory, binaryName, depth = 0) {
-    if (depth > 5) return null
-    let entries
-    try {
-      entries = requireDirectory(directory)
-    } catch {
-      return null
-    }
-    for (const entry of entries) {
-      if (entry.isFile && entry.name.toLowerCase() === binaryName.toLowerCase()) return join(directory, entry.name)
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory) continue
-      const found = findGhBinary(join(directory, entry.name), binaryName, depth + 1)
-      if (found !== null) return found
-    }
-    return null
-  }
-
-  function requireDirectory(directory) {
-    // Kept synchronous and tiny: the archive layout is known and shallow.
-    return readdirSync(directory, { withFileTypes: true })
-  }
-
-  async function extractGhArchive(archive, destination, extension) {
-    if (extension === 'tar.gz') {
-      const result = await runCaptured('tar', ['-xzf', archive, '-C', destination], { timeoutMs: 120000 })
-      if (result.code !== 0) throw new Error(`解压 gh 失败：${result.stderr.slice(0, 300)}`)
-      return
-    }
-    if (process.platform === 'win32') {
-      const quote = (value) => `'${String(value).replace(/'/g, "''")}'`
-      const script = `Expand-Archive -LiteralPath ${quote(archive)} -DestinationPath ${quote(destination)} -Force`
-      const result = await runCaptured(process.env.DSH_POWERSHELL || 'powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-      ], { timeoutMs: 120000, limit: 256 * 1024 })
-      if (result.code !== 0) throw new Error(`解压 gh 失败：${result.stderr.slice(0, 300)}`)
-      return
-    }
-    const result = await runCaptured('unzip', ['-o', '-q', archive, '-d', destination], { timeoutMs: 120000 })
-    if (result.code !== 0) throw new Error(`解压 gh 失败：${result.stderr.slice(0, 300)}`)
-  }
-
-  async function ensureGh() {
-    if (ghBinaryPath !== null && existsSync(ghBinaryPath)) return ghBinaryPath
-    if (ghInstallPromise !== null) return await ghInstallPromise
-    ghInstallPromise = (async () => {
-      const target = ghAssetTarget()
-      const release = await fetchGhRelease()
-      const version = cleanString(String(release.tag_name ?? ''), 32).replace(/^v/, '')
-      if (!/^[0-9A-Za-z._-]+$/.test(version)) throw new Error('gh release tag 不合法')
-      const assetName = `gh_${version}_${target.assetPlatform}_${target.arch}.${target.extension}`
-      const asset = Array.isArray(release.assets) ? release.assets.find((entry) => entry.name === assetName) : undefined
-      if (asset === undefined) throw new Error(`未找到 gh 资产：${assetName}`)
-      let expected = typeof asset.digest === 'string' && asset.digest.startsWith('sha256:') ? asset.digest.slice(7) : ''
-      if (!/^[0-9a-f]{64}$/i.test(expected)) {
-        const checksumAsset = Array.isArray(release.assets)
-          ? release.assets.find((entry) => typeof entry.name === 'string' && entry.name.endsWith('_checksums.txt'))
-          : undefined
-        if (checksumAsset === undefined) throw new Error('无法获得 gh 校验和')
-        const response = await fetch(checksumAsset.browser_download_url, {
-          headers: { 'user-agent': 'dsh-secret-vault' },
-          signal: AbortSignal.timeout(config.ghDownloadTimeoutMs),
-        })
-        if (!response.ok) throw new Error(`下载 gh 校验和失败：HTTP ${response.status}`)
-        const text = await response.text()
-        const line = text.split(/\r?\n/).find((entry) => entry.trim().endsWith(assetName))
-        if (line === undefined) throw new Error(`校验和文件里没有 ${assetName}`)
-        expected = line.trim().split(/\s+/)[0]
-      }
-      if (!/^[0-9a-f]{64}$/i.test(expected)) throw new Error('gh 校验和格式不合法')
-      const root = resolve(config.ghDir || join(storeDir, 'gh'))
-      const directory = join(root, version)
-      const binary = join(directory, target.binaryName)
-      if (existsSync(binary)) {
-        ghBinaryPath = binary
-        ghInstalledVersion = version
-        return binary
-      }
-      await mkdir(directory, { recursive: true, mode: 0o700 })
-      const archive = join(directory, `gh-${version}.${target.extension}`)
-      const response = await fetch(asset.browser_download_url, {
-        headers: { 'user-agent': 'dsh-secret-vault' },
-        signal: AbortSignal.timeout(config.ghDownloadTimeoutMs),
-      })
-      if (!response.ok) throw new Error(`下载 gh 失败：HTTP ${response.status}`)
-      const bytes = Buffer.from(await response.arrayBuffer())
-      const actual = createHash('sha256').update(bytes).digest('hex')
-      if (actual.toLowerCase() !== expected.toLowerCase()) throw new Error('gh 下载校验失败（SHA-256 不匹配），已拒绝安装')
-      await writeFile(archive, bytes, { mode: 0o600 })
-      const extractDir = await mkdtemp(join(root, `extract-${version}-`))
-      try {
-        await extractGhArchive(archive, extractDir, target.extension)
-        const found = findGhBinary(extractDir, target.binaryName)
-        if (found === null) throw new Error('gh 压缩包里没有找到可执行文件')
-        await mkdir(directory, { recursive: true, mode: 0o700 })
-        await rename(found, binary)
-        if (process.platform !== 'win32') await chmod(binary, 0o755)
-      } finally {
-        await rm(extractDir, { recursive: true, force: true }).catch(() => {})
-        await rm(archive, { force: true }).catch(() => {})
-      }
-      ghBinaryPath = binary
-      ghInstalledVersion = version
-      return binary
-    })().catch((error) => {
-      ghInstallPromise = null
-      throw new Error(`自动下载 gh 失败：${redactText(messageOf(error))}`)
-    })
-    return await ghInstallPromise
-  }
-
-  function ghTool() {
-    return {
-      name: 'vault_gh',
-      description: 'Run the managed GitHub CLI (gh) with a controlled credential injected as GH_TOKEN. gh is downloaded on first use from the official cli/cli release and verified by SHA-256; no binary is bundled. `args` is an argv array (no shell): prefer --json/--jq to keep output small. Requires a controlled credential; sealed/ephemeral are refused. Denied: extension/alias/config/auth subcommands and --hostname/--show-token.',
-      parameters: {
-        type: 'object',
-        properties: {
-          credential: { type: 'string', description: 'Controlled credential id from vault_list.' },
-          args: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'gh argv after the binary, e.g. ["repo","list","--json","name,isPrivate","--jq",".[].name"].',
-          },
-          timeoutMs: { type: 'number', description: 'Optional run timeout in milliseconds (default 60000, max 300000).' },
-        },
-        required: ['credential', 'args'],
-        additionalProperties: false,
-      },
-      timeoutMs: 300000,
-      output: {
-        schema: {
-          type: 'object',
-          properties: {
-            exitCode: { type: 'number' },
-            stdout: { type: 'string' },
-            stderr: { type: 'string' },
-            ghVersion: { type: 'string' },
-          },
-          required: ['exitCode', 'stdout'],
-          additionalProperties: false,
-        },
-        render: (_args, value) => [{
-          type: 'text',
-          text: [
-            `gh ${value?.ghVersion ? `v${value.ghVersion}` : ''} exit=${value?.exitCode}`,
-            value?.stdout ?? '',
-            value?.stderr ? `[stderr]\n${value.stderr}` : '',
-          ].filter((line) => line !== '').join('\n'),
-        }],
-      },
-      async execute(args, exec) {
-        await ensureLoaded()
-        const item = data.items[String(args?.credential ?? '')]
-        if (!item) throw new Error(`未知凭证 id：${String(args?.credential ?? '')}`)
-        if (item.level !== 'controlled') {
-          throw new Error(`凭证 ${item.id} 的等级是 ${item.level}；vault_gh 会把值注入子进程环境，只允许 controlled。sealed/ephemeral 请用 vault_http。`)
-        }
-        const argv = Array.isArray(args?.args) ? args.args : null
-        if (argv === null || argv.length === 0 || argv.length > 64) throw new Error('args 必须是 1-64 个元素的字符串数组')
-        let total = 0
-        for (const entry of argv) {
-          if (typeof entry !== 'string' || entry.length === 0 || entry.length > 4096) throw new Error('args 里每个元素必须是非空字符串（≤4096 字符）')
-          if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(entry)) throw new Error('args 不允许包含控制字符')
-          total += entry.length
-        }
-        if (total > 16000) throw new Error('args 总长度过大')
-        const command = argv[0].toLowerCase()
-        if (GH_DENIED_COMMANDS.has(command)) throw new Error(`vault_gh 不允许执行 gh ${command}（会绕过凭证边界）`)
-        for (const entry of argv) {
-          const lower = entry.toLowerCase()
-          if (GH_DENIED_FLAGS.has(lower) || lower.startsWith('--hostname=')) throw new Error(`vault_gh 不允许参数 ${entry}`)
-        }
-        if (command.startsWith('-') && command !== '--version' && command !== '--help') {
-          throw new Error('vault_gh 的 args 第一个元素必须是 gh 子命令（或 --version/--help）')
-        }
-        const denial = useDenial(item)
-        if (denial !== null) throw new Error(denial)
-        const binary = await ensureGh()
-        const timeoutMs = Math.min(300000, Math.max(1000, toInt(args?.timeoutMs, config.ghTimeoutMs, 1000, 300000)))
-        const cwd = typeof exec?.agent?.session?.header?.cwd === 'string' && exec.agent.session.header.cwd !== ''
-          ? exec.agent.session.header.cwd
-          : process.cwd()
-        const run = async () => {
-          const limited = item.maxUses > 0
-          if (limited) await reserveUse(item, exec, 'gh')
-          try {
-            const env = { ...process.env }
-            for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_HOST']) delete env[key]
-            env.GH_TOKEN = item.secret
-            env.GH_NO_UPDATE_NOTIFIER = '1'
-            env.GH_PROMPT_DISABLED = '1'
-            env.NO_COLOR = '1'
-            env.CLICOLOR = '0'
-            const result = await runCaptured(binary, argv, {
-              cwd, env, timeoutMs, signal: exec?.signal, limit: config.ghMaxOutputChars,
-            })
-            const stdout = redactText(result.stdout.slice(0, config.ghMaxOutputChars))
-            const stderr = redactText(result.stderr.slice(0, config.ghMaxOutputChars))
-            if (limited) auditUsed(item, exec, 'gh')
-            else noteUse(item, exec, 'gh', true)
-            return {
-              exitCode: typeof result.code === 'number' ? result.code : -1,
-              stdout,
-              stderr,
-              ghVersion: ghInstalledVersion,
-            }
-          } catch (error) {
-            if (limited) releaseUse(item)
-            auditDenied(item, exec, 'gh')
-            throw new Error(`gh 执行失败：${redactText(messageOf(error))}`)
-          }
-        }
-        return item.maxUses > 0 ? await withUseLock(run) : await run()
-      },
-    }
   }
 
   const logger = {
@@ -1352,618 +1073,6 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  function httpTool() {
-    return {
-      name: 'vault_http',
-      description: 'Perform one HTTP request with a stored credential injected by the vault. The secret never appears in these arguments or in the result. The request host and method must be allowed by the credential; redirects are not followed. For an ephemeral credential the user is asked to confirm this single use. Returns a bounded, scrubbed response body.',
-      parameters: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', description: 'Credential id from vault_list.' },
-          method: { type: 'string', enum: HTTP_METHODS, description: 'HTTP method; must be in the credential allowed methods.' },
-          url: { type: 'string', description: 'Absolute http(s) URL. Its host must be in the credential allowlist.' },
-          headers: { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra request headers. Authentication headers are managed by the vault.' },
-          body: { type: 'string', description: 'Optional request body (text).' },
-        },
-        required: ['id', 'method', 'url'],
-        additionalProperties: false,
-      },
-      timeoutMs: 240000,
-      output: {
-        schema: {
-          type: 'object',
-          properties: {
-            status: { type: 'number' },
-            contentType: { type: 'string' },
-            body: { type: 'string' },
-            truncated: { type: 'boolean' },
-            redacted: { type: 'boolean' },
-            note: { type: 'string' },
-          },
-          required: ['status', 'body'],
-          additionalProperties: false,
-        },
-        render: (_args, value) => [{
-          type: 'text',
-          text: [
-            `HTTP ${value?.status}${value?.truncated ? '（body 已截断）' : ''}${value?.redacted ? '（body 已脱敏）' : ''}`,
-            value?.contentType ? `content-type: ${value.contentType}` : '',
-            value?.note ? value.note : '',
-            '',
-            value?.body ?? '',
-          ].filter((line, index) => line !== '' || index === 3).join('\n'),
-        }],
-      },
-      async execute(args, exec) {
-        await ensureLoaded()
-        const id = String(args.id ?? '')
-        const initial = data.items[id]
-        if (!initial) throw new Error(`未知凭证 id：${id}`)
-        const limitedRun = initial.maxUses > 0 || initial.level === 'ephemeral' || initial.burnAfterUse
-        const run = async () => {
-          const item = data.items[id]
-          if (!item) throw new Error(`未知凭证 id：${id}`)
-          const denial = useDenial(item)
-          if (denial !== null) throw new Error(denial)
-          const method = cleanString(String(args.method ?? ''), 8).toUpperCase()
-          if (!HTTP_METHODS.includes(method)) throw new Error(`不支持的 HTTP 方法：${method}`)
-          if (!item.methods.includes(method)) throw new Error(`凭证 ${item.id} 不允许方法 ${method}；允许：${item.methods.join(', ')}`)
-          const replaceMeta = (text) => (typeof text === 'string'
-            ? text.replace(META_PLACEHOLDER_RE, (whole, refId, key) => {
-              if (refId !== item.id) return whole
-              const value = item.meta?.[key]
-              return typeof value === 'string' && value !== '' ? value : whole
-            })
-            : text)
-          const rawUrl = replaceMeta(String(args.url ?? ''))
-          if (rawUrl.includes('[[vault:')) throw new Error('URL 中还有未解析的字段占位符；请先在凭证的附加字段里填写')
-          let url
-          try {
-            url = new URL(rawUrl)
-          } catch {
-            throw new Error('url 不是合法 URL')
-          }
-          if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('只允许 http(s) URL')
-          const loopbackTarget = url.hostname === '127.0.0.1' || url.hostname === '::1' || url.hostname === 'localhost'
-          if (item.level !== 'controlled' && url.protocol !== 'https:' && !loopbackTarget) {
-            throw new Error('密封/一次性凭证只允许 https（本机 loopback 除外），防止明文传输')
-          }
-          if (url.username || url.password) throw new Error('url 中不允许出现 userinfo；凭证由 vault 注入')
-          const host = url.hostname.toLowerCase().replace(/\.$/, '')
-          if (!hostAllowed(host, item.hosts)) throw new Error(`凭证 ${item.id} 不允许访问主机 ${host}；允许：${item.hosts.join(', ') || '（未配置）'}`)
-          if (item.level === 'ephemeral') await askEphemeralApproval(item, method, host, url, exec)
-          const afterApproval = useDenial(item)
-          if (afterApproval !== null) throw new Error(afterApproval)
-
-          const headers = new Headers()
-          const modelHeaders = args.headers && typeof args.headers === 'object' ? args.headers : {}
-          for (const [key, value] of Object.entries(modelHeaders)) {
-            const headerName = String(key ?? '').trim()
-            if (headerName === '') continue
-            const lowerName = headerName.toLowerCase()
-            if (FORBIDDEN_REQUEST_HEADERS.has(lowerName) || lowerName.startsWith('x-forwarded-')) {
-              throw new Error(`不允许自行设置请求头 ${headerName}；认证头由 vault 注入`)
-            }
-            const valueText = replaceMeta(String(value ?? ''))
-            if (valueText.includes('[[vault:')) throw new Error(`请求头 ${headerName} 中还有未解析的字段占位符`)
-            headers.set(headerName, valueText)
-          }
-          const auth = item.auth ?? { type: 'bearer' }
-          if (auth.type === 'bearer') headers.set('authorization', `Bearer ${item.secret}`)
-          else if (auth.type === 'basic') headers.set('authorization', `Basic ${Buffer.from(`${auth.username ?? ''}:${item.secret}`, 'utf8').toString('base64')}`)
-          else if (auth.type === 'header') headers.set(auth.name || 'X-Api-Key', item.secret)
-          else if (auth.type === 'query') url.searchParams.set(auth.name || 'api_key', item.secret)
-
-          const limited = item.maxUses > 0
-          if (limited) await reserveUse(item, exec, method)
-          const burnNow = item.burnAfterUse && item.level === 'ephemeral'
-            && (item.maxUses === 0 || item.useCount >= item.maxUses)
-          if (burnNow) {
-            delete data.items[item.id]
-            rebuildSecrets()
-            try {
-              await persist()
-            } catch (error) {
-              data.items[item.id] = item
-              rebuildSecrets()
-              if (limited) releaseUse(item)
-              throw new Error(`焚毁凭证失败，已拒绝本次使用：${messageOf(error)}`)
-            }
-          }
-
-          const bodyText = method === 'GET' || method === 'HEAD'
-            ? undefined
-            : (typeof args.body === 'string' ? replaceMeta(args.body) : undefined)
-          if (typeof bodyText === 'string' && bodyText.includes('[[vault:')) throw new Error('请求体里还有未解析的字段占位符')
-          const controller = new AbortController()
-          const abort = () => controller.abort()
-          const timer = setTimeout(() => controller.abort(), config.httpTimeoutMs)
-          timer.unref?.()
-          if (exec.signal) {
-            if (exec.signal.aborted) controller.abort()
-            else exec.signal.addEventListener('abort', abort, { once: true })
-          }
-          let response
-          let text = ''
-          let truncated = false
-          try {
-            response = await fetch(url, {
-              method,
-              headers,
-              body: bodyText,
-              redirect: 'manual',
-              signal: controller.signal,
-            })
-            const read = await readCappedText(response, config.maxResponseChars)
-            text = read.text
-            truncated = read.truncated
-          } catch (error) {
-            if (limited) releaseUse(item)
-            auditDenied(item, exec, method)
-            throw new Error(`请求失败：${redactText(messageOf(error))}`)
-          } finally {
-            clearTimeout(timer)
-            try { exec.signal?.removeEventListener?.('abort', abort) } catch { /* ignore */ }
-          }
-          const redacted = redactText(text)
-          const wasRedacted = redacted !== text
-          auditUsed(item, exec, method)
-          return {
-            status: response.status,
-            contentType: response.headers.get('content-type') ?? '',
-            body: redacted.slice(0, config.maxResponseChars),
-            truncated,
-            redacted: wasRedacted,
-            ...(response.status >= 300 && response.status < 400 ? { note: '未跟随重定向；如需访问目标请直接请求允许的主机。' } : {}),
-          }
-        }
-        return limitedRun ? await withUseLock(run) : await run()
-      },
-    }
-  }
-
-  function imapTool() {
-    const IMAP_ACTIONS = ['list', 'search', 'fetch']
-
-    function isLoopbackHostname(host) {
-      return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1'
-    }
-
-    /**
-     * The model never supplies host/port. The target must come from the credential's
-     * immutable `hosts` list (or a non-secret `imap_host` meta field that is itself in
-     * that list), so a sealed credential can only ever reach the hosts it was created for.
-     */
-    function resolveImapTarget(item) {
-      const hosts = Array.isArray(item.hosts)
-        ? item.hosts.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
-        : []
-      const meta = item.meta && typeof item.meta === 'object' ? item.meta : {}
-      let host = typeof meta.imap_host === 'string' ? meta.imap_host.trim().toLowerCase() : ''
-      if (host !== '') {
-        if (host.startsWith('*.') || !hostAllowed(host, hosts)) {
-          throw new Error(`凭证 ${item.id} 的附加字段 imap_host（${host}）不在 hosts 白名单里；请先在设置页把它加入 hosts`)
-        }
-      } else {
-        const concrete = hosts.filter((entry) => !entry.startsWith('*.'))
-        if (concrete.length === 0) {
-          throw new Error(`凭证 ${item.id} 没有可用的 IMAP 主机；请在 hosts 里填写 imap 服务器域名，或在附加字段设置 imap_host`)
-        }
-        host = concrete.find((entry) => /(^|\.)imap[.-]/.test(entry))
-          ?? concrete.find((entry) => entry.includes('imap'))
-          ?? concrete[0]
-      }
-      const port = toInt(meta.imap_port, 993, 1, 65535)
-      // STARTTLS on 143 would send LOGIN in the clear unless we implemented the upgrade;
-      // refusing is safer than silently downgrading. Implicit TLS (993) is the supported path.
-      if (port === 143) throw new Error('不支持 STARTTLS（143 端口）；请使用 993 隐式 TLS，或在附加字段把 imap_port 指向 TLS 端口')
-      const plaintext = config.imapAllowPlaintextLoopback === true && isLoopbackHostname(host)
-      return { host, port, useTls: !plaintext }
-    }
-
-    /** username: meta.username -> meta.email -> the `user` half of `user,pass`. */
-    function resolveImapCredentials(item) {
-      let username = ''
-      for (const key of ['username', 'email']) {
-        const value = item.meta?.[key]
-        if (typeof value === 'string' && value.trim() !== '') {
-          username = value.trim()
-          break
-        }
-      }
-      let password = typeof item.secret === 'string' ? item.secret : ''
-      const comma = password.indexOf(',')
-      if (comma !== -1) {
-        if (username === '') username = password.slice(0, comma).trim()
-        password = password.slice(comma + 1)
-      }
-      if (username === '') {
-        throw new Error('无法确定 IMAP 用户名；请在附加字段填写 username 或 email，或把 secret 存成 user,pass 形式')
-      }
-      if (password.trim() === '') {
-        throw new Error(`凭证 ${item.id} 没有可用的 IMAP 密码/授权码；请在设置页轮换该凭证`)
-      }
-      return { username, password }
-    }
-
-    function imapMailboxArg(value) {
-      const raw = value === undefined || value === null || value === '' ? 'INBOX' : String(value).trim()
-      if (raw.length > 200) throw new Error('mailbox 名称过长（≤200 字符）')
-      if (/[\u0000-\u001f\u007f]/.test(raw)) throw new Error('mailbox 不允许包含控制字符')
-      if (!/^[\x20-\x7e]+$/.test(raw)) {
-        throw new Error('IMAP 邮箱名只支持 ASCII（暂不支持 UTF-7 编码）；常见名称：INBOX、Sent Messages、Drafts')
-      }
-      return raw
-    }
-
-    function scrubImapText(state, text, max) {
-      const original = typeof text === 'string' ? text : ''
-      const cleaned = redactText(original)
-      if (cleaned !== original) state.redacted = true
-      return cleaned.slice(0, max)
-    }
-
-    /** Hard output budget: shrink text first, then trailing array elements. */
-    function fitImapBudget(value) {
-      const limit = toInt(config.maxResponseChars, 24000, 2000, 100000)
-      let copy = { ...value }
-      const size = () => JSON.stringify(copy).length
-      if (size() <= limit) return copy
-      copy.truncated = true
-      for (const key of ['text', 'headers']) {
-        if (typeof copy[key] !== 'string') continue
-        const over = size() - limit
-        if (over > 0) copy[key] = copy[key].slice(0, Math.max(0, copy[key].length - over - 100))
-      }
-      for (const key of ['messages', 'mailboxes', 'attachments']) {
-        if (!Array.isArray(copy[key])) continue
-        while (copy[key].length > 1 && size() > limit) copy[key].pop()
-      }
-      if (size() > limit && typeof copy.text === 'string') copy.text = copy.text.slice(0, 500)
-      if (size() > limit && typeof copy.headers === 'string') copy.headers = copy.headers.slice(0, 500)
-      if (size() > limit) {
-        copy = { action: copy.action, truncated: true, note: 'IMAP 响应超过输出上限，已截断' }
-      }
-      return copy
-    }
-
-    async function runList(session) {
-      const state = { redacted: false }
-      const cap = toInt(config.imapMaxMailboxes, 200, 1, 2000)
-      const all = await session.listMailboxes()
-      const mailboxes = all.slice(0, cap).map((entry) => ({
-        name: scrubImapText(state, entry.name, 300),
-        delimiter: scrubImapText(state, entry.delimiter, 8),
-        attributes: entry.attributes.map((attribute) => scrubImapText(state, attribute, 40)).slice(0, 16),
-      }))
-      return { action: 'list', mailboxes, truncated: all.length > mailboxes.length, redacted: state.redacted }
-    }
-
-    async function runSearch(session, mailbox, criteria, limit) {
-      const state = { redacted: false }
-      const headerCap = toInt(config.imapMaxHeaderChars, 8000, 500, 100000)
-      const found = await session.search({ mailbox, criteria, limit })
-      const summaries = found.uids.length === 0
-        ? []
-        : await session.fetchSummaries({ mailbox, uids: found.uids, maxHeaderChars: headerCap })
-      const byUid = new Map(summaries.map((entry) => [entry.uid, entry]))
-      const messages = []
-      let headerTruncated = false
-      for (const uid of found.uids) {
-        const entry = byUid.get(uid)
-        if (entry === undefined) continue
-        if (entry.headersTruncated) headerTruncated = true
-        const header = parseHeaderBlock(entry.headers)
-        messages.push({
-          uid,
-          from: scrubImapText(state, header.from, 300),
-          subject: scrubImapText(state, header.subject, 400),
-          date: scrubImapText(state, header.date, 100),
-          size: entry.size,
-        })
-      }
-      return {
-        action: 'search',
-        mailbox: scrubImapText(state, mailbox, 200),
-        total: found.total,
-        uids: found.uids,
-        messages,
-        truncated: found.total > found.uids.length || headerTruncated,
-        redacted: state.redacted,
-      }
-    }
-
-    async function runFetch(session, mailbox, uid, part, maxChars) {
-      const state = { redacted: false }
-      const headerCap = toInt(config.imapMaxHeaderChars, 8000, 500, 100000)
-      const byteCap = Math.min(
-        toInt(config.imapMaxTextBytes, 65536, 1024, 4 * 1024 * 1024),
-        Math.max(1024, maxChars * 4),
-      )
-      const message = await session.fetchMessage({
-        mailbox, uid, part, maxHeaderChars: headerCap, maxTextBytes: byteCap,
-      })
-      const value = {
-        action: 'fetch',
-        mailbox: scrubImapText(state, mailbox, 200),
-        uid,
-        size: message.size,
-        attachments: message.attachments.map((attachment) => ({
-          filename: scrubImapText(state, attachment.filename, 200),
-          size: attachment.size,
-          type: scrubImapText(state, attachment.type, 80),
-        })),
-        truncated: message.truncated === true,
-      }
-      if (part === 'text') value.text = scrubImapText(state, message.text, maxChars)
-      else value.headers = scrubImapText(state, message.headers, headerCap)
-      value.redacted = state.redacted
-      return value
-    }
-
-    return {
-      name: 'vault_imap',
-      description: 'Read email through a stored credential with a native, read-only IMAP session inside the Host process; the secret never enters tool arguments, child processes or results. Works for controlled/sealed/ephemeral credentials. Actions: list mailboxes; search a mailbox (since/before/from/subject/body/text/unseen) and return each hit\'s UID plus From/Subject/Date/size; fetch one UID\'s headers or a size-capped text part (attachments are metadata only). TLS is mandatory except a loopback-only test switch; only ASCII mailbox names and search strings are supported. No command can modify flags or messages (EXAMINE + BODY.PEEK only).',
-      parameters: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', description: 'Credential id from vault_list.' },
-          action: { type: 'string', enum: IMAP_ACTIONS, description: 'list | search | fetch.' },
-          mailbox: { type: 'string', description: 'Mailbox name, ASCII only; default INBOX.' },
-          since: { type: 'string', description: 'search: messages on/after this date (YYYY-MM-DD or DD-Mon-YYYY).' },
-          before: { type: 'string', description: 'search: messages before this date (YYYY-MM-DD or DD-Mon-YYYY).' },
-          from: { type: 'string', description: 'search: FROM substring/address, ASCII only.' },
-          subject: { type: 'string', description: 'search: SUBJECT substring, ASCII only.' },
-          body: { type: 'string', description: 'search: BODY substring, ASCII only.' },
-          text: { type: 'string', description: 'search: TEXT substring (headers and body), ASCII only.' },
-          unseen: { type: 'boolean', description: 'search: only messages without the \\Seen flag.' },
-          limit: { type: 'number', description: 'search: max newest results (default 20, max 100).' },
-          uid: { type: 'number', description: 'fetch: message UID from a search result.' },
-          part: { type: 'string', enum: ['headers', 'text'], description: 'fetch: which part to return; default headers.' },
-          maxChars: { type: 'number', description: 'fetch text: max characters (default 4000, capped by the profile).' },
-          timeoutMs: { type: 'number', description: 'Overall session timeout in milliseconds (default 60000, max 300000).' },
-        },
-        required: ['id', 'action'],
-        additionalProperties: false,
-      },
-      timeoutMs: 300000,
-      output: {
-        schema: {
-          type: 'object',
-          properties: {
-            action: { type: 'string' },
-            mailbox: { type: 'string' },
-            mailboxes: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  name: { type: 'string' },
-                  delimiter: { type: 'string' },
-                  attributes: { type: 'array', items: { type: 'string' } },
-                },
-                required: ['name'],
-                additionalProperties: false,
-              },
-            },
-            total: { type: 'number' },
-            uids: { type: 'array', items: { type: 'number' } },
-            messages: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  uid: { type: 'number' },
-                  from: { type: 'string' },
-                  subject: { type: 'string' },
-                  date: { type: 'string' },
-                  size: { type: 'number' },
-                },
-                required: ['uid'],
-                additionalProperties: false,
-              },
-            },
-            uid: { type: 'number' },
-            size: { type: 'number' },
-            headers: { type: 'string' },
-            text: { type: 'string' },
-            attachments: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  filename: { type: 'string' },
-                  size: { type: 'number' },
-                  type: { type: 'string' },
-                },
-                required: ['filename', 'size', 'type'],
-                additionalProperties: false,
-              },
-            },
-            truncated: { type: 'boolean' },
-            redacted: { type: 'boolean' },
-            note: { type: 'string' },
-          },
-          required: ['action'],
-          additionalProperties: false,
-        },
-        render: (_args, value) => {
-          const lines = []
-          if (value?.action === 'list') {
-            const mailboxes = Array.isArray(value.mailboxes) ? value.mailboxes : []
-            lines.push(`IMAP 邮箱（${mailboxes.length}）${value.truncated ? '（已截断）' : ''}：`)
-            for (const mailbox of mailboxes) {
-              const attributes = mailbox.attributes?.length ? ` [${mailbox.attributes.join(' ')}]` : ''
-              lines.push(`- ${mailbox.name}${mailbox.delimiter ? ` (delimiter=${mailbox.delimiter})` : ''}${attributes}`)
-            }
-            if (mailboxes.length === 0) lines.push('（没有返回邮箱）')
-          } else if (value?.action === 'search') {
-            const messages = Array.isArray(value.messages) ? value.messages : []
-            lines.push(`IMAP SEARCH ${value.mailbox ?? ''}：命中 ${value.total ?? 0} 封，返回 ${messages.length} 封${value.truncated ? '（已截断）' : ''}`)
-            for (const message of messages) {
-              lines.push(`- UID ${message.uid} | ${message.date || '无日期'} | ${message.from || '未知发件人'} | ${message.subject || '（无主题）'} | ${message.size ?? 0} bytes`)
-            }
-          } else if (value?.action === 'fetch') {
-            lines.push(`IMAP FETCH ${value.mailbox ?? ''} uid=${value.uid} size=${value.size ?? 0}${value.truncated ? '（已截断）' : ''}`)
-            if (Array.isArray(value.attachments) && value.attachments.length > 0) {
-              lines.push(`附件（仅元数据）：${value.attachments.map((attachment) => `${attachment.filename} ${attachment.size} bytes ${attachment.type}`).join('; ')}`)
-            }
-            if (typeof value.headers === 'string') lines.push('', value.headers)
-            if (typeof value.text === 'string') lines.push('', value.text)
-          } else {
-            lines.push('IMAP 无结果')
-          }
-          if (value?.redacted) lines.push('', '（结果已脱敏）')
-          if (value?.note) lines.push(value.note)
-          return [{ type: 'text', text: lines.join('\n') }]
-        },
-      },
-      async execute(args, exec) {
-        await ensureLoaded()
-        const id = String(args?.id ?? '')
-        const initial = data.items[id]
-        if (!initial) throw new Error(`未知凭证 id：${id}`)
-        const action = cleanString(String(args?.action ?? ''), 16).toLowerCase()
-        if (!IMAP_ACTIONS.includes(action)) throw new Error('action 必须是 list / search / fetch')
-        const limitedRun = initial.maxUses > 0 || initial.level === 'ephemeral' || initial.burnAfterUse
-        const run = async () => {
-          const item = data.items[id]
-          if (!item) throw new Error(`未知凭证 id：${id}`)
-          const denial = useDenial(item)
-          if (denial !== null) throw new Error(denial)
-          const target = resolveImapTarget(item)
-          const credentials = resolveImapCredentials(item)
-          const mailbox = action === 'list' ? 'INBOX' : imapMailboxArg(args?.mailbox)
-          let criteria = ''
-          let limit = 0
-          let uid = 0
-          let part = 'headers'
-          let maxChars = 0
-          if (action === 'search') {
-            for (const key of ['since', 'before', 'from', 'subject', 'body', 'text']) {
-              const value = args?.[key]
-              if (value !== undefined && value !== null && value !== '' && typeof value !== 'string') {
-                throw new Error(`${key} 必须是字符串`)
-              }
-            }
-            criteria = buildSearchCriteria({
-              since: args?.since,
-              before: args?.before,
-              from: args?.from,
-              subject: args?.subject,
-              body: args?.body,
-              text: args?.text,
-              unseen: args?.unseen === true,
-            })
-            limit = toInt(args?.limit, 20, 1, 100)
-          } else if (action === 'fetch') {
-            const rawUid = typeof args?.uid === 'number' ? args.uid : Number.parseInt(String(args?.uid ?? ''), 10)
-            if (!Number.isSafeInteger(rawUid) || rawUid <= 0 || rawUid > 4294967295) {
-              throw new Error('fetch 需要正整数 uid（来自 search 结果）')
-            }
-            uid = rawUid
-            if (args?.part !== undefined && args.part !== 'headers' && args.part !== 'text') {
-              throw new Error('part 只能是 headers 或 text')
-            }
-            part = args?.part === 'text' ? 'text' : 'headers'
-            const textLimit = toInt(config.imapMaxTextChars, 12000, 500, 200000)
-            maxChars = toInt(args?.maxChars, Math.min(4000, textLimit), 200, textLimit)
-          }
-          if (item.level === 'ephemeral') {
-            await askEphemeralApproval(item, `IMAP ${action.toUpperCase()}`, target.host, {
-              origin: `imap://${target.host}:${target.port}`,
-              pathname: '',
-            }, exec)
-          }
-          const afterApproval = useDenial(item)
-          if (afterApproval !== null) throw new Error(afterApproval)
-          const limited = item.maxUses > 0
-          if (limited) await reserveUse(item, exec, `imap:${action}`)
-          const burnNow = item.burnAfterUse && item.level === 'ephemeral'
-            && (item.maxUses === 0 || item.useCount >= item.maxUses)
-          if (burnNow) {
-            delete data.items[item.id]
-            rebuildSecrets()
-            try {
-              await persist()
-            } catch (error) {
-              data.items[item.id] = item
-              rebuildSecrets()
-              if (limited) releaseUse(item)
-              throw new Error(`焚毁凭证失败，已拒绝本次使用：${messageOf(error)}`)
-            }
-          }
-
-          const timeoutMs = Math.min(300000, Math.max(1000, toInt(args?.timeoutMs, toInt(config.imapTimeoutMs, 60000, 1000, 300000), 1000, 300000)))
-          const controller = new AbortController()
-          const abort = () => controller.abort(new Error('IMAP 操作已取消'))
-          const timer = setTimeout(() => controller.abort(new Error(`IMAP 整体超时（${timeoutMs}ms）`)), timeoutMs)
-          timer.unref?.()
-          if (exec?.signal) {
-            if (exec.signal.aborted) controller.abort(new Error('IMAP 操作已取消'))
-            else exec.signal.addEventListener('abort', abort, { once: true })
-          }
-          let session = null
-          try {
-            session = await openImapSession({
-              host: target.host,
-              port: target.port,
-              useTls: target.useTls,
-              connectTimeoutMs: toInt(config.imapConnectTimeoutMs, 15000, 500, 120000),
-              commandTimeoutMs: toInt(config.imapCommandTimeoutMs, 20000, 500, 120000),
-              maxBufferBytes: toInt(config.imapMaxBufferBytes, 2 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
-              maxLiteralBytes: toInt(config.imapMaxLiteralBytes, 512 * 1024, 16 * 1024, 32 * 1024 * 1024),
-              maxRecords: toInt(config.imapMaxRecords, 5000, 100, 100000),
-              signal: controller.signal,
-            })
-            await session.login(credentials.username, credentials.password)
-            let value
-            if (action === 'list') value = await runList(session)
-            else if (action === 'search') value = await runSearch(session, mailbox, criteria, limit)
-            else value = await runFetch(session, mailbox, uid, part, maxChars)
-            auditUsed(item, exec, `imap:${action}`)
-            return fitImapBudget(value)
-          } catch (error) {
-            if (limited) releaseUse(item)
-            auditDenied(item, exec, `imap:${action}`)
-            throw new Error(`IMAP ${action} 失败：${redactText(messageOf(error)).slice(0, 600)}`)
-          } finally {
-            clearTimeout(timer)
-            try { exec?.signal?.removeEventListener?.('abort', abort) } catch { /* ignore */ }
-            try { await session?.logout() } catch { /* best effort */ }
-          }
-        }
-        return limitedRun ? await withUseLock(run) : await run()
-      },
-    }
-  }
-
-  async function readCappedText(response, maxChars) {
-    const reader = response.body?.getReader?.()
-    if (!reader) {
-      const text = await response.text()
-      return { text: text.slice(0, maxChars), truncated: text.length > maxChars }
-    }
-    const decoder = new TextDecoder()
-    let out = ''
-    let done = false
-    while (out.length <= maxChars) {
-      const part = await reader.read()
-      if (part.done) {
-        done = true
-        break
-      }
-      out += decoder.decode(part.value, { stream: true })
-    }
-    if (!done) {
-      try { await reader.cancel() } catch { /* ignore */ }
-      out += decoder.decode()
-      return { text: out.slice(0, maxChars), truncated: true }
-    }
-    out += decoder.decode()
-    return { text: out.slice(0, maxChars), truncated: out.length > maxChars }
-  }
-
   async function askEphemeralApproval(item, method, host, url, exec) {
     const userQuestions = ctx.get('userQuestions')
     if (!userQuestions || typeof userQuestions.ask !== 'function') throw new Error('一次性凭证需要用户确认，但当前没有 userQuestions 服务')
@@ -1998,6 +1107,46 @@ export function apply(ctx, rawConfig) {
     const approved = selected.includes('允许一次') || (selected.length === 0 && custom === '允许一次')
     if (!approved) throw new Error('用户未批准本次使用')
   }
+
+  // ------------------------------------------------------- transport host
+  /**
+   * The narrow surface every transport receives. It deliberately does NOT expose the
+   * raw vault object: a transport can look up one item, redact text, account a use,
+   * ask for ephemeral approval, persist, and write a produced artifact. Storage, policy
+   * immutability, audit shape and the guard stay in this file.
+   */
+  const vaultHost = {
+    config,
+    storeDir,
+    logger,
+    items: () => data?.items ?? {},
+    item: (id) => data?.items?.[String(id ?? '')],
+    ensureLoaded,
+    redact: (text) => redactText(text),
+    findSecret: (text) => findSecretInText(text),
+    useDenial,
+    withUseLock,
+    reserveUse,
+    releaseUse,
+    auditUsed,
+    auditDenied,
+    noteUse,
+    askEphemeralApproval,
+    persist,
+    rebuildSecrets,
+    toInt,
+    cleanString,
+    messageOf,
+    hostAllowed,
+    metaPlaceholderRe: META_PLACEHOLDER_RE,
+    httpMethods: HTTP_METHODS,
+    artifact: null,
+  }
+  vaultHost.artifact = createArtifactSink({ config, host: vaultHost })
+  const registry = createTransportRegistry(vaultHost, transportFactories)
+  vaultHost.registry = registry
+  const transportsTool = createTransportsTool(registry)
+  const artifactTool = createArtifactTool({ host: vaultHost, registry })
 
   // ------------------------------------------------------------------ hooks
 
@@ -2125,6 +1274,17 @@ export function apply(ctx, rawConfig) {
       if (config.denyPathReads) {
         const reason = protectedPathReason(pathTokens, storeDir, dshHome)
         if (reason !== null) return `secret-vault: 读取凭证存储被禁止（${reason}）`
+        // vault_save is the only writer and never returns content; all other tools are
+        // refused when they name a file under an artifact directory.
+        if (name !== 'vault_save') {
+          const artifactDirs = [
+            ...(Array.isArray(config.artifactAllowDirs) ? config.artifactAllowDirs : []),
+            config.artifactDefaultDir,
+            config.artifactAutoDir,
+          ]
+          const artifactReason = protectedArtifactReason(pathTokens, artifactDirs)
+          if (artifactReason !== null) return `secret-vault: 读取落盘产物目录被禁止（${artifactReason}）`
+        }
       }
       const spillHit = pathTokens.some((token) => token.includes('dsh-spill-') || token.includes('dsh-subprocess-'))
       if (config.denySpillReads && spillHit) {
@@ -2137,7 +1297,7 @@ export function apply(ctx, rawConfig) {
       for (const entry of allStrings) {
         const hit = findSecretInText(entry)
         if (hit !== null) {
-          return `secret-vault: 工具参数里出现了凭证 ${hit} 的明文值；请改用 [[vault:${hit}]] 占位符或 vault_http`
+          return `secret-vault: 工具参数里出现了凭证 ${hit} 的明文值；请改用 [[vault:${hit}]] 占位符、vault_http、vault_imap 或 vault_save`
         }
       }
       if (name === 'vault_http') {
@@ -2168,6 +1328,8 @@ export function apply(ctx, rawConfig) {
           '- `vault_http({ id, method, url, headers?, body? })` performs one HTTP request with the secret injected by the vault. The host and method must be allowed by that credential; redirects are not followed; the response is bounded and scrubbed.',
           '- `vault_imap({ id, action, mailbox?, ... })` reads mail through a native read-only IMAP session inside the Host process: `list` mailboxes, `search` (since/before/from/subject/body/text/unseen) for UIDs plus From/Subject/Date/size, `fetch` one UID\'s headers or a size-capped text part. It works for sealed/ephemeral credentials because the value never leaves the Host; TLS is mandatory, only ASCII mailbox names/search strings are supported, and no command can modify mail.',
           '- `vault_gh({ credential, args })` runs the managed GitHub CLI (`gh`) with a controlled credential injected as GH_TOKEN. gh is downloaded on first use from the official cli/cli release and verified by SHA-256; `args` is an argv array, and `--json`/`--jq` keep output small. sealed/ephemeral credentials are refused.',
+          '- `vault_transports()` lists the available transport channels, the policy fields each uses, and the actions/artifact sources each exposes. It is static metadata only.',
+          '- `vault_save({ id, source, dir?, filename?, maxBytes?, overwrite? })` writes bytes produced by a transport to a file inside `artifactAllowDirs` and returns only `{path, bytes, sha256}`. `source` is typed, e.g. `{ transport: "imap", mailbox, uid, part: "attachment:0" }` or `{ transport: "http", url, method }`. It never returns content; reading the saved path through other tools is blocked by the guard. Executable/script extensions are denied by default and the size cap is enforced.',
           '- For a `controlled` credential you may also write the placeholder `[[vault:<id>]]` inside a bash/pwsh command; the vault replaces it just before execution while the session log keeps the placeholder. `sealed` and `ephemeral` credentials must use `vault_http` or `vault_imap`.',
           '- Non-secret fields stored on a credential (for example `account_id` for Cloudflare) are shown by `vault_list` as names only; values stay hidden and can be referenced as `[[vault:<id>:<field>]]` in a bash/pwsh command, in a `vault_http` URL, or in its headers/body.',
           '- `ephemeral` credentials ask the user for confirmation on every use.',
@@ -2178,9 +1340,11 @@ export function apply(ctx, rawConfig) {
   }
 
   ctx.effect(() => ctx.tools.register(listTool()), 'secret-vault: vault_list tool')
-  ctx.effect(() => ctx.tools.register(httpTool()), 'secret-vault: vault_http tool')
-  ctx.effect(() => ctx.tools.register(imapTool()), 'secret-vault: vault_imap tool')
-  ctx.effect(() => ctx.tools.register(ghTool()), 'secret-vault: vault_gh tool')
+  ctx.effect(() => ctx.tools.register(transportsTool), 'secret-vault: vault_transports tool')
+  for (const tool of registry.tools()) {
+    ctx.effect(() => ctx.tools.register(tool), `secret-vault: ${tool.name} tool`)
+  }
+  ctx.effect(() => ctx.tools.register(artifactTool), 'secret-vault: vault_save tool')
 
   // ------------------------------------------------------------------- api
 

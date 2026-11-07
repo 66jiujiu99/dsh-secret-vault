@@ -433,19 +433,29 @@ function findDisposition(node) {
   return null
 }
 
-/** Walk BODYSTRUCTURE and collect attachment metadata only (never bytes). */
-export function collectAttachments(structure, depth = 0) {
+/**
+ * Walk BODYSTRUCTURE and collect attachment metadata plus the IMAP part number needed
+ * to fetch the bytes (`1`, `2`, `1.1`, ...). `index` is the stable 0-based ordinal used
+ * by `vault_imap`'s attachment list and by `vault_save`'s `attachment:<index>`.
+ */
+export function collectAttachmentParts(structure, depth = 0) {
   const out = []
-  const walk = (node, level) => {
+  const walk = (node, prefix, level) => {
     if (level > 12 || !Array.isArray(node) || node.length === 0) return
     if (Array.isArray(node[0])) {
-      for (const child of node) if (Array.isArray(child)) walk(child, level + 1)
+      let index = 0
+      for (const child of node) {
+        if (!Array.isArray(child)) continue
+        index += 1
+        walk(child, prefix === '' ? String(index) : `${prefix}.${index}`, level + 1)
+      }
       return
     }
     if (node.length < 7) return
     const type = String(node[0] ?? '').toUpperCase()
     const subtype = String(node[1] ?? '').toUpperCase()
     const params = paramDict(node[2])
+    const encoding = String(node[5] ?? '').toUpperCase()
     const size = Number(node[6]) || 0
     const disposition = findDisposition(node)
     const filename = decodeMimeWords(String(disposition?.params?.FILENAME ?? params.FILENAME ?? params.NAME ?? '')).trim()
@@ -453,13 +463,36 @@ export function collectAttachments(structure, depth = 0) {
     if (!isAttachment) return
     if (out.length >= 50) return
     out.push({
+      index: out.length,
+      part: prefix === '' ? '1' : prefix,
       filename: (filename || '(未命名)').slice(0, 200),
       size,
       type: `${type.toLowerCase() || 'application'}/${subtype.toLowerCase() || 'octet-stream'}`,
+      encoding,
     })
   }
-  walk(structure, depth)
+  walk(structure, '', depth)
   return out
+}
+
+/** Public metadata shape used by vault_imap (no part numbers / encodings). */
+export function collectAttachments(structure, depth = 0) {
+  return collectAttachmentParts(structure, depth).map((entry) => ({
+    filename: entry.filename,
+    size: entry.size,
+    type: entry.type,
+  }))
+}
+
+/** Decode an IMAP body literal according to its Content-Transfer-Encoding. */
+export function decodeTransfer(buffer, encoding) {
+  const kind = String(encoding ?? '').toUpperCase()
+  if (kind === 'BASE64') {
+    const text = buffer.toString('latin1').replace(/[^A-Za-z0-9+/=]/g, '')
+    return Buffer.from(text, 'base64')
+  }
+  if (kind === 'QUOTED-PRINTABLE') return decodeQuotedPrintable(buffer.toString('latin1'))
+  return buffer
 }
 
 function parseFetchRecord(record) {
@@ -706,6 +739,103 @@ export class ImapSession {
       truncated: headers.length > maxHeaderChars,
       attachments,
     }
+  }
+
+  /**
+   * Fetch one attachment's bytes by 0-based index in `collectAttachmentParts`.
+   * The caller (transport) raises the session literal cap to cover the encoded size;
+   * this method enforces the decoded size cap before returning.
+   */
+  async fetchAttachment({ mailbox, uid, index, maxBytes }) {
+    await this.examine(mailbox)
+    const metaResult = await this.command(
+      `UID FETCH ${uid} (UID RFC822.SIZE BODYSTRUCTURE)`,
+      { timeoutMs: this.commandTimeoutMs },
+    )
+    this.assertOk(metaResult, 'FETCH BODYSTRUCTURE')
+    let meta = null
+    for (const record of metaResult.records) {
+      const parsed = parseFetchRecord(record)
+      if (parsed.uid === uid) {
+        meta = parsed
+        break
+      }
+    }
+    if (meta === null) throw new ImapError(`未找到 UID ${uid} 的邮件（可能已被移动或删除）`)
+    const parts = collectAttachmentParts(meta.structure)
+    if (!Number.isInteger(index) || index < 0 || index >= parts.length) {
+      throw new ImapError(`邮件只有 ${parts.length} 个可落盘附件，index ${String(index)} 超出范围`)
+    }
+    const part = parts[index]
+    // Base64 expands by 4/3 and quoted-printable can reach 3x (every byte `=XX`); ask
+    // only for what the decoded cap needs in the worst case for that encoding.
+    const ratio = part.encoding === 'QUOTED-PRINTABLE' ? 3 : part.encoding === 'BASE64' ? 4 / 3 : 1
+    const encodedMax = Math.ceil(maxBytes * ratio) + 16
+    const result = await this.command(
+      `UID FETCH ${uid} (UID BODY.PEEK[${part.part}]<0.${encodedMax}>)`,
+      { timeoutMs: this.commandTimeoutMs },
+    )
+    this.assertOk(result, `FETCH 附件 ${part.part}`)
+    let literal = null
+    for (const record of result.records) {
+      const parsed = parseFetchRecord(record)
+      if (parsed.uid === uid && record.literals.length > 0) {
+        literal = record.literals[0]
+        break
+      }
+    }
+    if (literal === null) throw new ImapError(`附件 ${index} 没有返回数据`)
+    // A partial FETCH must not be mistaken for the whole attachment: a truncated body
+    // would otherwise be written as a shorter but "valid" file. BODYSTRUCTURE's octet
+    // count is the encoded size, so compare against the literal we actually received.
+    if (part.size > 0 && literal.length < part.size) {
+      throw new ImapError(`附件没有完整返回（${literal.length}/${part.size} 字节），超过 ${maxBytes} 字节上限或服务器未按 partial 返回；已拒绝落盘`)
+    }
+    if (part.size === 0 && literal.length >= encodedMax) {
+      throw new ImapError(`无法确认附件完整（命中 ${encodedMax} 字节 partial 上限），已拒绝落盘`)
+    }
+    const data = decodeTransfer(literal, part.encoding)
+    if (data.length > maxBytes) {
+      throw new ImapError(`附件解码后 ${data.length} 字节超过 ${maxBytes} 字节上限，已拒绝落盘`)
+    }
+    if (literal.length >= encodedMax && data.length >= maxBytes) {
+      // We hit our own partial cap at exactly the decoded limit; a server that reports
+      // decoded octets in BODYSTRUCTURE could still have more data. Refuse rather than
+      // write a file that might be a prefix.
+      throw new ImapError(`附件可能被 partial 截断（命中 ${encodedMax} 字节上限），已拒绝落盘`)
+    }
+    return {
+      data,
+      filename: part.filename,
+      contentType: part.type,
+      encodedBytes: literal.length,
+    }
+  }
+
+  /** Fetch a text body or header block as raw bytes (for vault_save). */
+  async fetchPart({ mailbox, uid, part, maxBytes }) {
+    await this.examine(mailbox)
+    const section = part === 'text'
+      ? `BODY.PEEK[TEXT]<0.${maxBytes + 1}>`
+      : `BODY.PEEK[HEADER.FIELDS (${HEADER_FIELDS_FETCH})]`
+    const result = await this.command(
+      `UID FETCH ${uid} (UID RFC822.SIZE ${section})`,
+      { timeoutMs: this.commandTimeoutMs },
+    )
+    this.assertOk(result, 'FETCH')
+    let literal = null
+    for (const record of result.records) {
+      const parsed = parseFetchRecord(record)
+      if (parsed.uid === uid && record.literals.length > 0) {
+        literal = record.literals[0]
+        break
+      }
+    }
+    if (literal === null) throw new ImapError(`未找到 UID ${uid} 的 ${part} 内容`)
+    if (literal.length > maxBytes) {
+      throw new ImapError(`${part} 内容 ${literal.length} 字节超过 ${maxBytes} 字节上限，已拒绝落盘`)
+    }
+    return { data: literal, contentType: 'text/plain; charset=utf-8' }
   }
 
   async logout() {
